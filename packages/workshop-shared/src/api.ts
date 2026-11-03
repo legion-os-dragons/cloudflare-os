@@ -4139,6 +4139,8 @@ export interface WorkpiecesSubscriber {
  * GadgetClient.listBindings().
  */
 export type GadgetBindingInfo = {
+  /** Present for a named, attenuated gadget capability rather than a gatekeeper. */
+  capability?: import('./gadget-capabilities').GadgetCapabilitySpec;
   /** The binding name, as it appears in the gadget worker's `env`. */
   name: string;
 
@@ -4295,6 +4297,13 @@ export type BlueprintBinding = {
    * it up to the recipient.
    */
   suggestedModel?: {provider: string, modelName: string};
+} | {
+  /** A named capability from another gadget in the same workspace. */
+  type:'gadgetCapability';
+  /** Exact read/write authority and domain protocol required by the consumer. */
+  capability:import('./gadget-capabilities').GadgetCapabilitySpec;
+  /** Standalone gadgets may run without this connection. */
+  optional?:true;
 } | {
   /** An agent spawner binding. */
   type: "agentSpawner";
@@ -4491,6 +4500,15 @@ export type GadgetAccessConfiguration =
  * sharing, actions, blueprint listing) stay on Overseer; this covers the per-gadget surface.
  */
 export interface GadgetClient extends WorkpieceClient {
+  /** List the producer's explicitly exported projection/command ports. */
+  getCapabilityExports():Promise<import('./gadget-capabilities').GadgetCapabilityExports>;
+
+  /**
+   * Grant a named same-workspace gadget port; raw gadget capabilities cannot be bound.
+   * Gadgets reaching a command port require build access for interactive roots and exports.
+   * Keep a separate projection-only gadget when sharing a UI with use-role collaborators.
+   */
+  bindCapability(name:string,target:WorkpieceId,spec:import('./gadget-capabilities').GadgetCapabilitySpec,chatId?:number):Promise<void>;
   /** Current OS admission mode; this never returns the key or its digest. */
   getAccessMode(): Promise<'workspace' | 'key'>;
 

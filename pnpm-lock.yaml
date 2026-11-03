@@ -84,6 +84,9 @@ importers:
 
   packages/bundled-blueprints:
     dependencies:
+      '@gadgets/workshop-shared':
+        specifier: workspace:*
+        version: link:../workshop-shared
       yjs:
         specifier: ^13.6.32
         version: 13.6.32

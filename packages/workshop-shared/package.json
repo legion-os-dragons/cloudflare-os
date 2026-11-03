@@ -34,6 +34,14 @@
     "./theme": {
       "types": "./src/theme.ts",
       "import": "./src/theme.ts"
+    },
+    "./gadget-capabilities": {
+      "types": "./src/gadget-capabilities.ts",
+      "import": "./src/gadget-capabilities.ts"
+    },
+    "./gadget-capabilities-server": {
+      "types": "./src/gadget-capabilities-server.ts",
+      "import": "./src/gadget-capabilities-server.ts"
     }
   },
   "scripts": {

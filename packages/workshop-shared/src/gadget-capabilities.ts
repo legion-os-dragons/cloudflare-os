@@ -1,5 +1,8 @@
 import type { RpcTarget, RpcStub } from "capnweb";
 
+/** Reserved producer-only environment key. Never return its value from a gadget root. */
+export const GADGET_CAPABILITY_BRIDGE_TOKEN = "GADGET_CAPABILITY_BRIDGE_TOKEN";
+
 /** Data crossing a gadget connection. RPC capabilities and executable values are excluded. */
 export type GadgetCapabilityJson =
   | null

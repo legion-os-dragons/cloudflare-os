@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { env, RpcTarget, RpcStub } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
+import { GADGET_CAPABILITY_BRIDGE_TOKEN } from "@gadgets/workshop-shared/gadget-capabilities";
 import type { OverseerDurableObject } from "../src/overseer";
 import { openFakeOverseer } from "./fixtures";
 const projection = { port: "facts", kind: "projection", protocol: "facts/1" } as const;
@@ -18,7 +19,7 @@ const producer = `import{DurableObject,RpcTarget,WorkerEntrypoint}from'cloudflar
 export class Gadget extends DurableObject{
  constructor(ctx,env){super(ctx,env);this.ctx=ctx;this.listeners=new Set();ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS facts(id TEXT PRIMARY KEY,value TEXT,grantor TEXT,consumer INTEGER)');}
  snapshot(request){if(request.pause)return new Promise(resolve=>{this.resumeRead=()=>resolve(this.snapshot({}));});if(request.leak)return new Hidden();return{revision:String(this.ctx.storage.sql.exec('SELECT COUNT(*) AS n FROM facts').one().n),facts:[...this.ctx.storage.sql.exec('SELECT * FROM facts ORDER BY id')]};}
- async record(request,context){const old=this.ctx.storage.sql.exec('SELECT value FROM facts WHERE id=?',request.id).toArray()[0];if(old){if(old.value!==request.value)throw Error('Fact identity conflict');return this.snapshot({});}this.ctx.storage.sql.exec('INSERT INTO facts VALUES(?,?,?,?)',request.id,request.value,context.grantedBy,context.consumerGadgetId);const value=this.snapshot({});await Promise.all([...this.listeners].map(observer=>observer.changed(value.revision).catch(()=>{this.listeners.delete(observer);observer[Symbol.dispose]();})));return value;}
+ async record(request,context,token){if(!this.env.GADGET_CAPABILITY_BRIDGE_TOKEN||token!==this.env.GADGET_CAPABILITY_BRIDGE_TOKEN)throw Error('Bridge required');const old=this.ctx.storage.sql.exec('SELECT value FROM facts WHERE id=?',request.id).toArray()[0];if(old){if(old.value!==request.value)throw Error('Fact identity conflict');return this.snapshot({});}this.ctx.storage.sql.exec('INSERT INTO facts VALUES(?,?,?,?)',request.id,request.value,context.grantedBy,context.consumerGadgetId);const value=this.snapshot({});await Promise.all([...this.listeners].map(observer=>observer.changed(value.revision).catch(()=>{this.listeners.delete(observer);observer[Symbol.dispose]();})));return value;}
  resume(){this.resumeRead?.();this.resumeRead=undefined;}
  pending(){return!!this.resumeRead;}
  watchCount(){return this.listeners.size;}
@@ -28,7 +29,7 @@ class Lease extends RpcTarget{constructor(cancel){super();this.cancel=cancel;}[S
 export class CapabilityHandler extends WorkerEntrypoint{
  describe(){return{facts:{kind:'projection',protocol:'facts/1'},recordFact:{kind:'command',protocol:'facts-command/1'}};}
  project(gadget,port,request){if(port!=='facts')throw Error('Unknown read');return gadget.snapshot(request);}
- command(gadget,port,request,context){if(port!=='recordFact')throw Error('Unknown command');return gadget.record(request,context);}
+ command(gadget,port,request,context){if(port!=='recordFact')throw Error('Unknown command');return gadget.record(request,context,this.env.GADGET_CAPABILITY_BRIDGE_TOKEN);}
  watch(gadget,port,request,observer){if(port!=='facts')throw Error('Unknown watch');return gadget.watch(observer);}}
 `;
 const consumer = `import{DurableObject,WorkerEntrypoint}from'cloudflare:workers';export class Gadget extends DurableObject{
@@ -48,6 +49,7 @@ async function withWorkspace(run: (impl: any, owner: any, viewer: any) => Promis
     env.TEST_OVERSEER.getByName(`capability-${++workspace}`),
     async (instance: OverseerDurableObject) => {
       const impl = (instance as unknown as { impl: any }).impl;
+      impl.ownerId = "owner-id";
       for (const [id, title, code] of [
         [1, "Facts", producer],
         [2, "Consumer", consumer],
@@ -86,6 +88,7 @@ async function withWorkspace(run: (impl: any, owner: any, viewer: any) => Promis
           impl.getGadgetFacet(id, chatId, kind),
         assertGadgetUseWithoutCommands: (id: number) => impl.assertGadgetUseWithoutCommands(id),
         getCapabilityExports: (id: number) => impl.getCapabilityExports(id),
+        executeGadgetCapability: (...args: any[]) => impl.executeGadgetCapability(...args),
         bindGadgetCapability: (...args: any[]) => impl.bindGadgetCapability(...args),
         revokeGadgetConnections: (id: number) => impl.revokeGadgetConnections(id),
         bumpVersion: (ids: number[]) => impl.bumpVersion(ids),
@@ -178,14 +181,14 @@ it("disconnect revokes retained facets and notifications; reconnect reads missed
     using _subscription = await retained.subscribe({}, observer);
     const source = await impl.getGadgetFacetFetcher(1);
     expect(await source.watchCount()).toBe(1);
-    await source.record({ id: "one", value: "1" }, { grantedBy: "owner-id", consumerGadgetId: 2 });
+    await impl.executeGadgetCapability(1, command, { id: "one", value: "1" }, "owner-id");
     await observer.changed("barrier");
     expect(events).toContain("1");
     impl.unbindWorkpiece(2, "READ");
     await expect(retained.project({})).rejects.toThrow("revoked");
     await expect.poll(() => source.watchCount()).toBe(0);
     await expect.poll(() => closed.length).toBe(1);
-    await source.record({ id: "two", value: "2" }, { grantedBy: "owner-id", consumerGadgetId: 2 });
+    await impl.executeGadgetCapability(1, command, { id: "two", value: "2" }, "owner-id");
     await observer.changed("barrier");
     expect(events).not.toContain("2");
     await target.bindCapability("READ", 1, projection);
@@ -321,4 +324,91 @@ it("rechecks source admission after asynchronous declaration lookup", () =>
       message: expect.stringContaining("changed while granting"),
     });
     expect(impl.storage.gadgets.get(2).bindings.READ).toBeUndefined();
+  }));
+
+it("seals each producer bridge and provides build-only standalone commands without a self-edge", () =>
+  withWorkspace(async (impl, owner, viewer) => {
+    const source = await owner.getGadget(1);
+    await expect(
+      (await viewer.getGadget(1)).executeCapability(command, { id: "denied", value: "bad" }),
+    ).rejects.toThrow("Unauthorized");
+    await expect(
+      source.executeCapability({ ...command, protocol: "wrong" }, { id: "denied", value: "bad" }),
+    ).rejects.toThrow("does not match");
+    const producerEnv = impl.getEnvForLoader(1, { from: "gadget", gadgetId: 1 });
+    const otherEnv = impl.getEnvForLoader(3, { from: "gadget", gadgetId: 3 });
+    const secret = producerEnv[GADGET_CAPABILITY_BRIDGE_TOKEN];
+    expect(typeof secret).toBe("string");
+    expect(secret).toHaveLength(64);
+    expect(otherEnv[GADGET_CAPABILITY_BRIDGE_TOKEN]).not.toBe(secret);
+    const raw = await impl.getGadgetFacetFetcher(1);
+    await rejected(
+      () =>
+        raw.record({ id: "spoof", value: "bad" }, { grantedBy: "victim", consumerGadgetId: 99 }),
+      "Bridge required",
+    );
+    await rejected(
+      () =>
+        raw.record(
+          { id: "spoof", value: "bad" },
+          { grantedBy: "victim", consumerGadgetId: 99 },
+          otherEnv[GADGET_CAPABILITY_BRIDGE_TOKEN],
+        ),
+      "Bridge required",
+    );
+    const result = await source.executeCapability(command, {
+      id: "self",
+      value: "ok",
+      actor: "victim",
+    });
+    expect(result.facts).toEqual([{ id: "self", value: "ok", grantor: "owner-id", consumer: 1 }]);
+    expect(impl.storage.gadgets.get(1).bindings).toEqual({});
+    expect(JSON.stringify(impl.collectBindingMetadata(1))).not.toContain(secret);
+    expect(() => impl.bindWorkpiece(1, GADGET_CAPABILITY_BRIDGE_TOKEN, 100)).toThrow("reserved");
+    impl.revokeGadgetConnectionSessions();
+    impl.bumpVersion([1]);
+    expect(
+      impl.getEnvForLoader(1, { from: "gadget", gadgetId: 1 })[GADGET_CAPABILITY_BRIDGE_TOKEN],
+    ).toBe(secret);
+    expect(
+      (await source.executeCapability(command, { id: "after", value: "restart" })).facts,
+    ).toHaveLength(2);
+    await expect(
+      impl.executeGadgetCommand(1, command, { id: "anonymous", value: "bad" }, 999),
+    ).rejects.toThrow("authenticated");
+    let currentRole: "build" | "use" | null = "build";
+    impl.users = {
+      idFromString: (id: string) => id,
+      get: () => ({ whoami: async () => ({ id: "agent-profile" }) }),
+    };
+    impl.authorizeCollaborator = async () => currentRole;
+    impl.getSharingManager = async () => ({ getEffectiveRole: () => currentRole });
+    impl.storage.chatMeta.put({id: 123, title: "Command", started: new Date(0), lastActive: new Date(0)});
+    impl.storage.activeAgents.put({ chatId: 123, initiatorUserId: "authenticated-agent-user" });
+    const agentResult = await impl.executeGadgetCommand(
+      1,
+      command,
+      { id: "agent", value: "trusted", grantedBy: "victim" },
+      123,
+    );
+    expect(agentResult.facts.find((fact: any) => fact.id === "agent")).toMatchObject({
+      grantor: "authenticated-agent-user",
+      consumer: 1,
+    });
+    currentRole = "use";
+    await expect(
+      impl.executeGadgetCommand(1, command, { id: "use-only", value: "bad" }, 123),
+    ).rejects.toThrow("current build access");
+    currentRole = null;
+    await expect(
+      impl.executeGadgetCommand(1, command, { id: "removed", value: "bad" }, 123),
+    ).rejects.toThrow("current build access");
+    currentRole = "build";
+    impl.authorizeCollaborator = async () => {
+      currentRole = "use";
+      return "build";
+    };
+    await expect(
+      impl.executeGadgetCommand(1, command, { id: "downgraded-during-check", value: "bad" }, 123),
+    ).rejects.toThrow("current build access");
   }));

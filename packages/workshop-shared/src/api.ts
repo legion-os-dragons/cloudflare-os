@@ -27,6 +27,7 @@ import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorAdminActionResult, VendorAdminView, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
+import { GADGET_CAPABILITY_BRIDGE_TOKEN } from "./gadget-capabilities.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -237,6 +238,8 @@ const RESERVED_WORDS = new Set([
  * generated names), not enforced here.
  */
 export function validateBindingName(name: string): void {
+  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN)
+    throw Error("This binding name is reserved for the native gadget command bridge.");
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
         `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
@@ -3492,6 +3495,11 @@ export type AiToolCall = {
    */
   output?: string;
 } | {
+  /** Execute a declared command under the authenticated agent initiator; replay returns recorded output. */
+  toolName: "executeGadgetCommand";
+  input: { gadget: string; port: string; protocol: string; request: import('./gadget-capabilities').GadgetCapabilityJson };
+  output?: import('./gadget-capabilities').GadgetCapabilityJson;
+} | {
   toolName: "setBindingHook";
   input: {
     bindingName: string;
@@ -4502,6 +4510,10 @@ export type GadgetAccessConfiguration =
 export interface GadgetClient extends WorkpieceClient {
   /** List the producer's explicitly exported projection/command ports. */
   getCapabilityExports():Promise<import('./gadget-capabilities').GadgetCapabilityExports>;
+
+  /** Build-only canonical command on this gadget; actor identity comes from the authenticated session. */
+  executeCapability(spec: import('./gadget-capabilities').GadgetCapabilitySpec,
+    request: import('./gadget-capabilities').GadgetCapabilityJson): Promise<import('./gadget-capabilities').GadgetCapabilityJson>;
 
   /**
    * Grant a named same-workspace gadget port; raw gadget capabilities cannot be bound.

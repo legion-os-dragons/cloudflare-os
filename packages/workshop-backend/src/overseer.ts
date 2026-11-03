@@ -3,8 +3,8 @@ import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
 import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
 import type {GadgetUpgradeSource, GadgetUpgradePreview} from '@gadgets/workshop-shared/api';
 import { gadgetAccessHash, assertGadgetAccess, guardGadgetExport } from "./gadget-access";
-import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
-import type {GadgetCapabilityExports,GadgetCapabilitySpec} from '@gadgets/workshop-shared/gadget-capabilities';
+import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,requireCapabilityJson,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
+import {GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
@@ -1105,6 +1105,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
+      // Private per-producer secrets for native command bridges; never blueprint/binding data.
+      gadgetCapabilityBridgeTokens: {} as Record<number, string>,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.
@@ -2668,6 +2670,54 @@ class OverseerImpl implements AgentHooks {
       .describe());
   }
 
+  private async authorizeGadgetCommandBuild(userId: string): Promise<void> {
+    if (!this.ownerId) throw Error("Unauthorized: workspace has been deleted.");
+    if (userId === this.ownerId) return;
+    const user = this.users.get(this.users.idFromString(userId));
+    const profile = await user.whoami();
+    const role = await this.authorizeCollaborator(profile.id, user, {requireRole: "build"});
+    // Verification awaits external resources; a downgrade during it must not retain old authority.
+    const sharing = await this.getSharingManager();
+    if (role !== "build" || sharing.getEffectiveRole(profile.id) !== "build")
+      throw Error("Unauthorized: gadget commands require current build access.");
+  }
+
+  // Build-only callers may invoke their own producer without creating a cyclic self-binding.
+  async executeGadgetCapability(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
+      request: GadgetCapabilityJson, grantedBy: string, chatId?: number): Promise<GadgetCapabilityJson> {
+    if (spec.kind !== "command") throw Error("Only a declared command port may be executed.");
+    requireCapabilityJson(request);
+    await this.authorizeGadgetCommandBuild(grantedBy);
+    using _commandSession = {[Symbol.dispose]: this.joinSession(grantedBy === this.ownerId ? "owner" : "build")};
+    const revision = this.getGadgetRecord(gadgetId).accessRevision ?? 0;
+    const authorize = () => {
+      if ((this.getGadgetRecord(gadgetId).accessRevision ?? 0) !== revision)
+        throw Error("This gadget command authority has been revoked.");
+    };
+    const handler = this.loadGadgetWorker(gadgetId, chatId).getEntrypoint<GadgetCapabilityHandler>("CapabilityHandler");
+    requireCapabilityExport(takeCapabilityExports(await handler.describe()), spec);
+    authorize();
+    const source = await this.getGadgetFacetFetcher(gadgetId, chatId);
+    try {
+      await this.authorizeGadgetCommandBuild(grantedBy);
+      authorize();
+      const result = takeCapabilityJson(await handler.command(source, spec.port, request, {
+        workspaceId: this.ctx.id.toString(), consumerGadgetId: gadgetId, producerGadgetId: gadgetId, grantedBy,
+      }));
+      await this.authorizeGadgetCommandBuild(grantedBy);
+      authorize();
+      return result;
+    } finally { disposeCapabilityResult(source); }
+  }
+
+  async executeGadgetCommand(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
+      request: GadgetCapabilityJson, chatId: number): Promise<GadgetCapabilityJson> {
+    const grantedBy = this.storage.activeAgents.get(chatId)?.initiatorUserId;
+    if (!grantedBy) throw Error("No authenticated agent turn can execute a gadget command.");
+    const target = this.resolveWorkpieceRoot(gadgetId, true, chatId).workpieceId;
+    return this.executeGadgetCapability(target, spec, request, grantedBy, chatId);
+  }
+
   async bindGadgetCapability(
     gadgetId: WorkpieceId,
     name: string,
@@ -2677,7 +2727,7 @@ class OverseerImpl implements AgentHooks {
     chatId?: number,
   ): Promise<void> {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME)
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN)
       throw Error("This binding name is reserved.");
     const producer = this.getGadgetRecord(target),
       consumer = this.getGadgetRecord(gadgetId);
@@ -2907,7 +2957,7 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME) {
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN) {
       throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
@@ -2976,7 +3026,7 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET" || newName === GIT_BINDING_NAME) {
+    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN) {
       throw new Error(`The binding name \`${newName}\` is reserved.`);
     }
     if (gadget.bindings[newName]) {
@@ -3805,6 +3855,13 @@ class OverseerImpl implements AgentHooks {
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback(edge.capability?{type:'gadgetCapability',gadgetId,name,generation:edge.capability.generation,epoch:this.#connectionEpoch}:{type: "gatekeeper", id: edge.target}, caller);
     }
+    const tokens = this.storage.gadgetCapabilityBridgeTokens.get();
+    if (!tokens[gadgetId]) {
+      tokens[gadgetId] = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
+      this.storage.gadgetCapabilityBridgeTokens.put(tokens);
+    }
+    // Last, so even legacy bindings cannot shadow the producer's native-only bridge key.
+    env[GADGET_CAPABILITY_BRIDGE_TOKEN] = tokens[gadgetId];
     return env;
   }
 
@@ -13247,6 +13304,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
   async getCapabilityExports():Promise<GadgetCapabilityExports>{return this.impl.getCapabilityExports(this.id);}
 
+  async executeCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    return this.impl.executeGadgetCapability(this.id, spec, request, this.clientUserId);
+  }
+
   async bindCapability(name:string,target:WorkpieceId,spec:GadgetCapabilitySpec,chatId?:number):Promise<void>{
     if(chatId!==undefined&&!this.impl.storage.chatMeta.get(chatId))throw Error(`No such chat: ${chatId}`);
     const author=chatId===undefined?undefined:await retryOnDoReset(()=>this.#clientUser.whoami(),this.impl.logger);
@@ -13553,6 +13614,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   async setAccess(_configuration: GadgetAccessConfiguration): Promise<void> { this.#deny(); }
   async getCapabilityExports():Promise<GadgetCapabilityExports>{this.#deny();}
   async bindCapability(_name:string,_target:WorkpieceId,_spec:GadgetCapabilitySpec,_chatId?:number):Promise<void>{this.#deny();}
+  async executeCapability(_spec: GadgetCapabilitySpec, _request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> { this.#deny(); }
 
   // --- Allowed methods ---
 

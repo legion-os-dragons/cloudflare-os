@@ -22,3 +22,6 @@ export {
   type ProjectionWatch,
   type ProjectionWatchOptions,
 } from "./src/watch";
+
+/** Reserved producer-only bridge environment key; its value is never client data. */
+export { GADGET_CAPABILITY_BRIDGE_TOKEN } from "@gadgets/workshop-shared/gadget-capabilities";

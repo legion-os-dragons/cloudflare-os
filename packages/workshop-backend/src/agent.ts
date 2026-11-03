@@ -18,7 +18,8 @@ import { formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
-import type {GadgetCapabilitySpec} from '@gadgets/workshop-shared/gadget-capabilities';
+import type {GadgetCapabilitySpec,GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
+import { requireCapabilityJson } from './gadget-capabilities';
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
@@ -623,6 +624,9 @@ export interface AgentHooks {
    * `addedBindings` on the "changes" message) so the pending edge gets sequence-stamped.
    */
   addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number,capability?:GadgetCapabilitySpec):void|Promise<void>;
+
+  /** Execute a named command for a build agent, attributed only to its authenticated initiator. */
+  executeGadgetCommand(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec, request: GadgetCapabilityJson, chatId: number): Promise<GadgetCapabilityJson>;
 
   /**
    * Prepare (seeding/naming lazily as needed) and return the chat's seed binding layer, including
@@ -2159,6 +2163,10 @@ async function runAgentPass(
                   // recorded no-op.
                   toolOutput = {text: jsonToolResultText({success: true})};
                   break;
+                case "executeGadgetCommand":
+                  if (toolCall.output === undefined) throw Error("executeGadgetCommand log is missing its result");
+                  toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  break;
                 case "setGadgetBinding":
                   // The recorded edge (registry state) already exists, stamped by the step's
                   // "changes" message, so replay just reproduces the recorded result.
@@ -3260,6 +3268,30 @@ async function runAgentPass(
           throw error;
         }
       }
+    }),
+
+    executeGadgetCommand: defineTool({
+      name: "executeGadgetCommand",
+      label: "Execute gadget command",
+      description: "Execute one explicitly exported command port on a gadget in your env. " +
+        "Use this for a standalone gadget's own canonical commands without a self-binding. " +
+        "Read its current projection first, include domain idempotency/head guards, and supply the exact declared port/protocol. " +
+        "The kernel derives the actor from the authenticated user; never supply actor/context or a bridge token.",
+      parameters: Type.Object({
+        gadget: Type.String({description: "Gadget binding name in your env."}),
+        port: Type.String(), protocol: Type.String(), request: Type.Unknown(),
+      }),
+      execute: async (toolCallId, {gadget, port, protocol, request}) => {
+        try {
+          const entry = chatBindings.get(gadget);
+          if (!entry || entry.type !== "workpiece") throw Error(`There is no gadget named "${gadget}" in your env.`);
+          const output = await hooks.executeGadgetCommand(entry.id, {port, protocol, kind: "command"}, requireCapabilityJson(request), chatId);
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
     }),
 
     setGadgetBinding: defineTool({

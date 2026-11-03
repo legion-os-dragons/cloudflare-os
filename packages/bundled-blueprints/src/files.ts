@@ -563,12 +563,17 @@ function auditInputs(
   librariesDir: string,
   label: string,
 ): Set<string> {
+  // Only the public, runtime-dependency-free capability ABI may cross from a gadget library
+  // into workshop-shared. Blueprints still enter solely through their library's public side.
+  const capabilityAbi = resolve(librariesDir, "..", "..", "workshop-shared", "src", "gadget-capabilities.ts");
   const own = new Set<string>();
   const entryPath = `${entry.name}.ts`;
   const seen = new Set([entryPath]);
   const queue = [entryPath];
   for (let importer = queue.pop(); importer !== undefined; importer = queue.pop()) {
     if (files.has(importer)) own.add(importer);
+    if (resolve(rootDir, importer) === capabilityAbi && (metafile.inputs[importer]?.imports.length ?? 0) > 0)
+      invalid(label, "the public capability ABI must not import runtime dependencies");
     for (const imported of metafile.inputs[importer]?.imports ?? []) {
       if (imported.external) {
         if (imported.path.includes("*")) {
@@ -603,8 +608,9 @@ function auditInputs(
             invalid(label, `${importer} imports ${specifier}, which does not resolve to the ` +
                 `library's ${side}.ts`);
           }
-        } else if (!contains(librariesDir, absolute) ||
-            absolute.split(/[\\/]/u).includes("node_modules")) {
+        } else if (!(specifier === "@gadgets/workshop-shared/gadget-capabilities" && absolute === capabilityAbi &&
+            contains(librariesDir, resolve(rootDir, importer))) &&
+            (!contains(librariesDir, absolute) || absolute.split(/[\\/]/u).includes("node_modules"))) {
           invalid(label, `${importer} imports ${specifier}, which is outside the gadget libraries`);
         }
       } else if (files.has(importer) &&
@@ -646,6 +652,8 @@ function nameLibraryModules(
   return text.replace(MODULE_COMMENT_PATTERN, (comment, path: string) => {
     if (!Object.hasOwn(metafile.inputs, path)) return comment;
     const absolute = resolve(rootDir, path);
+    if (absolute === resolve(librariesDir, "..", "..", "workshop-shared", "src", "gadget-capabilities.ts"))
+      return "// @gadgets/workshop-shared/gadget-capabilities";
     if (!contains(librariesDir, absolute)) return comment;
     const subpath = relative(librariesDir, absolute).split(/[\\/]/u).join("/");
     return `// ${PACKAGE_NAME}/libraries/${subpath}`;

@@ -1,6 +1,5 @@
 /** Canonical producer/broker contracts; type-only exports add no authority or runtime dependency. */
 export type {
-  GadgetAlarmScheduler,
   GadgetCapabilityExports,
   GadgetCapabilityIdentity,
   GadgetCapabilityJson,
@@ -12,6 +11,7 @@ export type {
 } from "@gadgets/workshop-shared/gadget-capabilities";
 
 export type {
+  GadgetAlarmScheduler,
   GadgetCapabilityHandler,
   GadgetProjectionNotification,
 } from "@gadgets/workshop-shared/gadget-capabilities-server";

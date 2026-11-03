@@ -5,10 +5,14 @@ import type {
   RpcTarget as NativeRpcTarget,
 } from "cloudflare:workers";
 import type {
+  GadgetAlarmScheduler as GadgetAlarmSchedulerContract,
   GadgetCapabilityExports,
   GadgetCommandContext,
   GadgetProjectionObserver,
 } from "./gadget-capabilities";
+
+/** Native RPC branding for the browser-safe, gadget-scoped alarm contract. */
+export interface GadgetAlarmScheduler extends WorkerEntrypoint<unknown>, GadgetAlarmSchedulerContract {}
 
 /** Native Worker RPC observer derived from the single revision notification contract. */
 export type GadgetProjectionNotification = NativeRpcTarget &

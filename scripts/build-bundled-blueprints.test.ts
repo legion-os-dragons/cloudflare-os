@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
+import {gzipSync,gunzipSync} from "node:zlib";
 import { afterEach, describe, it } from "node:test";
 import {
   buildContent,
+  parseArchive,
   serializeArchive,
 } from "../packages/bundled-blueprints/src/files.ts";
 
@@ -390,8 +392,14 @@ describe("bundled blueprint scripts", () => {
     let directory = await mkdtemp(join(tmpdir(), "bundled-blueprints-"));
     temporaryDirectories.push(directory);
     await writeFile(join(directory, "example.json"), `${JSON.stringify(presentation, null, 2)}\n`);
+    const sharedText='export const common = '+JSON.stringify('shared native module / '.repeat(1024))+';\n';
     await writeArchive(join(directory, "example.gadget"), 1,
-      new Map([["client.js", "// legacy\n"]]));
+      new Map([["client.js", "// legacy\n"],["lib/common.js",sharedText]]));
+    await writeFile(join(directory,"other.json"),JSON.stringify({...presentation,blueprintId:"format.other",title:"Other"}));
+    await writeArchive(join(directory,"other.gadget"),1,new Map([["client.js","// distinct sibling\n"],["lib/common.js",sharedText]]));
+    // Another valid native compressor setting must remain byte-for-byte untouched.
+    const legacy=parseArchive(await readFile(join(directory,"other.gadget")),"other");
+    await writeFile(join(directory,"other.gadget"),serializeArchive(legacy.metadata,gzipSync(gunzipSync(legacy.content),{level:1}),"other"));
 
     let generatedModule = await temporaryOutFile();
     let build = spawnSync(process.execPath, [buildScript, "--out", generatedModule], {
@@ -400,7 +408,20 @@ describe("bundled blueprint scripts", () => {
       encoding: "utf8",
     });
     assert.equal(build.status, 0, build.stderr);
-    assert.match(await readFile(generatedModule, "utf8"), /"blueprintId": "format\.example"/);
+    const generatedText=await readFile(generatedModule,"utf8");
+    assert.match(generatedText, /"blueprintId": "format\.example"/);
+    assert.match(generatedText,/const sharedFiles/);
+    assert.equal(generatedText.split(JSON.stringify(sharedText)).length-1,1,"common file payload is embedded once");
+    const expected=await Promise.all(["example","other"].map(async name=>({id:`format.${name}`,archive:(await readFile(join(directory,`${name}.gadget`))).toString("base64")})));
+    const verify=spawnSync(process.execPath,["--input-type=module","-e",`
+      import fs from "node:fs";import assert from "node:assert/strict";
+      import{createHash}from"node:crypto";import{createRequire}from"node:module";
+      const{build}=createRequire(process.cwd()+"/package.json")("esbuild");
+      const compiled=await build({stdin:{contents:fs.readFileSync(${JSON.stringify(generatedModule)},"utf8"),loader:"ts",resolveDir:process.cwd()},bundle:true,write:false,platform:"node",format:"esm",target:"es2022"});
+      const{BUNDLED_BLUEPRINTS}=await import("data:text/javascript;base64,"+Buffer.from(compiled.outputFiles[0].text).toString("base64"));
+      for(const entry of BUNDLED_BLUEPRINTS){const original=${JSON.stringify(expected)}.find(item=>item.id===entry.blueprintId);assert.ok(original);assert.equal(entry.archive,original.archive);assert.equal(createHash("sha256").update(Buffer.from(entry.archive,"base64")).digest("hex"),entry.contentHash);}
+    `],{cwd:packageRoot,encoding:"utf8"});
+    assert.equal(verify.status,0,verify.stderr);
 
     let incoming = join(directory, ".update.gadget");
     await writeArchive(incoming, 2, new Map([

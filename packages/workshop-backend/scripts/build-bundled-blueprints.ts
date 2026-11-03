@@ -14,6 +14,7 @@
 // sibling tasks (`build:integration-worker` and `test` both depend on `build:bundled-blueprints`),
 // so a test writing the default path races them.
 
+import {gzip} from "pako";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,7 @@ const outFile = resolve(pkgRoot, parseOutFlag() ?? join("src", "generated", "bun
 
 const { text: generated, count, totalBytes } = await generateBundledBlueprintsModule(sourceDir, {
   builtFrom: process.env.BUNDLED_BLUEPRINTS_DIR ? "BUNDLED_BLUEPRINTS_DIR" : "blueprints/",
+  archiveDictionaryGzip: snapshot=>gzip(snapshot,{level:9}),
 });
 
 // Skip the write when nothing changed. This script runs as a prerequisite of `build` and `test`,

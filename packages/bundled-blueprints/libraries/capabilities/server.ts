@@ -1,5 +1,6 @@
 /** Canonical producer/broker contracts; type-only exports add no authority or runtime dependency. */
 export type {
+  GadgetAlarmScheduler,
   GadgetCapabilityExports,
   GadgetCapabilityIdentity,
   GadgetCapabilityJson,
@@ -24,4 +25,4 @@ export {
 } from "./src/watch";
 
 /** Reserved producer-only bridge environment key; its value is never client data. */
-export { GADGET_CAPABILITY_BRIDGE_TOKEN } from "@gadgets/workshop-shared/gadget-capabilities";
+export { GADGET_CAPABILITY_BRIDGE_TOKEN, GADGET_ALARM_BINDING } from "@gadgets/workshop-shared/gadget-capabilities";

@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import { env, RpcTarget, RpcStub } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { GADGET_CAPABILITY_BRIDGE_TOKEN } from "@gadgets/workshop-shared/gadget-capabilities";
+import { GADGET_CAPABILITY_BRIDGE_TOKEN, GADGET_ALARM_BINDING } from "@gadgets/workshop-shared/gadget-capabilities";
 import type { OverseerDurableObject } from "../src/overseer";
 import { openFakeOverseer } from "./fixtures";
 const projection = { port: "facts", kind: "projection", protocol: "facts/1" } as const;
@@ -20,6 +20,11 @@ export class Gadget extends DurableObject{
  constructor(ctx,env){super(ctx,env);this.ctx=ctx;this.listeners=new Set();ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS facts(id TEXT PRIMARY KEY,value TEXT,grantor TEXT,consumer INTEGER)');}
  snapshot(request){if(request.pause)return new Promise(resolve=>{this.resumeRead=()=>resolve(this.snapshot({}));});if(request.leak)return new Hidden();return{revision:String(this.ctx.storage.sql.exec('SELECT COUNT(*) AS n FROM facts').one().n),facts:[...this.ctx.storage.sql.exec('SELECT * FROM facts ORDER BY id')]};}
  async record(request,context,token){if(!this.env.GADGET_CAPABILITY_BRIDGE_TOKEN||token!==this.env.GADGET_CAPABILITY_BRIDGE_TOKEN)throw Error('Bridge required');const old=this.ctx.storage.sql.exec('SELECT value FROM facts WHERE id=?',request.id).toArray()[0];if(old){if(old.value!==request.value)throw Error('Fact identity conflict');return this.snapshot({});}this.ctx.storage.sql.exec('INSERT INTO facts VALUES(?,?,?,?)',request.id,request.value,context.grantedBy,context.consumerGadgetId);const value=this.snapshot({});await Promise.all([...this.listeners].map(observer=>observer.changed(value.revision).catch(()=>{this.listeners.delete(observer);observer[Symbol.dispose]();})));return value;}
+ async scheduleAlarm(at,mode='once'){await this.ctx.storage.put('alarmMode',mode);await this.ctx.storage.put('alarmCalls',0);await this.env.GADGET_ALARM.setAlarm(at);return this.env.GADGET_ALARM.getAlarm();}
+ async alarm(){const calls=await this.ctx.storage.get('alarmCalls')??0;await this.ctx.storage.put('alarmCalls',calls+1);const mode=await this.ctx.storage.get('alarmMode');if(mode==='retry'&&calls===0)throw Error('Retry fixture');if(mode==='rearm')await this.env.GADGET_ALARM.setAlarm(Date.now()+60000);}
+ alarmCalls(){return this.ctx.storage.get('alarmCalls');}
+ alarmDeadline(){return this.env.GADGET_ALARM.getAlarm();}
+ cancelAlarm(){return this.env.GADGET_ALARM.deleteAlarm();}
  resume(){this.resumeRead?.();this.resumeRead=undefined;}
  pending(){return!!this.resumeRead;}
  watchCount(){return this.listeners.size;}
@@ -411,4 +416,27 @@ it("seals each producer bridge and provides build-only standalone commands witho
     await expect(
       impl.executeGadgetCommand(1, command, { id: "downgraded-during-check", value: "bad" }, 123),
     ).rejects.toThrow("current build access");
+    const rawAlarm = await impl.getGadgetFacetFetcher(1);
+    await rejected(() => rawAlarm.__runKernelAlarm(), "Unauthorized");
+    await rejected(() => rawAlarm.__runKernelAlarm(otherEnv[GADGET_CAPABILITY_BRIDGE_TOKEN]), "Unauthorized");
+    expect(() => impl.bindWorkpiece(1, GADGET_ALARM_BINDING, 100)).toThrow("reserved");
+    const previewAlarm = impl.getEnvForLoader(1, {from:"gadget",gadgetId:1}, 123)[GADGET_ALARM_BINDING];
+    await rejected(() => previewAlarm.setAlarm(Date.now()+60000), "Accept");
+    const makeDue = () => { const deadline=impl.storage.gadgetContinuations.get(1);impl.storage.gadgetContinuations.put({...deadline,at:Date.now()-1}); };
+    await rawAlarm.scheduleAlarm(Date.now()+60000);
+    expect(await rawAlarm.alarmDeadline()).toBeGreaterThan(Date.now());
+    makeDue();await impl.runGadgetContinuations();
+    expect(await rawAlarm.alarmCalls()).toBe(1);
+    expect(await rawAlarm.alarmDeadline()).toBeNull();
+    await rawAlarm.scheduleAlarm(Date.now()+60000,'retry');
+    makeDue();await impl.runGadgetContinuations();
+    expect(impl.storage.gadgetContinuations.get(1).attempts).toBe(1);
+    makeDue();await impl.runGadgetContinuations();
+    expect(await rawAlarm.alarmCalls()).toBe(2);
+    expect(await rawAlarm.alarmDeadline()).toBeNull();
+    await rawAlarm.scheduleAlarm(Date.now()+60000,'rearm');
+    makeDue();await impl.runGadgetContinuations();
+    expect(await rawAlarm.alarmDeadline()).toBeGreaterThan(Date.now());
+    await rawAlarm.cancelAlarm();
+    expect(await rawAlarm.alarmDeadline()).toBeNull();
   }));

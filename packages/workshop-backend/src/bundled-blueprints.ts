@@ -41,8 +41,12 @@ async function installOne(env: InstallEnv, entry: BundledBlueprint)
     : Promise<BlueprintPublicInfo> {
   // Parse through the ordinary archive reader so a corrupt bundled file fails the same way an
   // uploaded one would, rather than producing a half-installed blueprint.
+  const archiveBytes=Uint8Array.fromBase64(entry.archive);
+  const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",archiveBytes as BufferSource));
+  const actualHash=Array.from(digest,byte=>byte.toString(16).padStart(2,"0")).join("");
+  if(actualHash!==entry.contentHash)throw Error("Bundled archive fingerprint does not match its original bytes.");
   let {metadata, contentLength, content} = await parseBlueprintArchive(
-      new Response(Uint8Array.fromBase64(entry.archive) as BufferSource).body!);
+      new Response(archiveBytes as BufferSource).body!);
 
   // R2 needs a known length, and the archive is already fully in memory (it came out of the
   // Worker bundle), so buffer rather than plumbing a FixedLengthStream through as the upload path

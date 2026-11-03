@@ -308,8 +308,14 @@ describe("env.GIT presence", () => {
     // Observe the loopback targets rather than opaque service stubs.
     impl.makeBindingLoopback = (target: unknown) => target;
     seedGadget(impl, 100);
-    expect(impl.getEnvForLoader(100, { from: "gadget", gadgetId: 100 })).toEqual({
+    // The alarm is an opaque native service stub: do not ask the assertion
+    // formatter to inspect it across Durable Object contexts.
+    const { GADGET_ALARM: alarm, ...bindings } =
+        impl.getEnvForLoader(100, { from: "gadget", gadgetId: 100 });
+    expect(alarm !== undefined).toBe(true);
+    expect(bindings).toEqual({
       GADGET: { type: "gadget", id: 100 },
+      GADGET_CAPABILITY_BRIDGE_TOKEN: expect.any(String),
       GIT: { type: "git" },
     });
 

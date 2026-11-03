@@ -87,6 +87,19 @@ describe("bundled blueprints", () => {
       let content = r2.get(`${entry.blueprintId}/${record.metadata.version}`);
       expect(content, `${entry.blueprintId} content`).toBeDefined();
       expect(content!.byteLength).toBeGreaterThan(0);
+      const original=Uint8Array.fromBase64(entry.archive);
+      const originalHash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",original)),byte=>byte.toString(16).padStart(2,"0")).join("");
+      expect(originalHash).toBe(entry.contentHash);
+    }
+    if(BUNDLED_BLUEPRINTS.length){
+      const original=BUNDLED_BLUEPRINTS[0];
+      try{
+        BUNDLED_BLUEPRINTS[0]={...original,contentHash:"0".repeat(64)};
+        const corrupt=makeEnv();
+        expect(await installBundledBlueprints(corrupt.env)).toHaveLength(BUNDLED_BLUEPRINTS.length-1);
+        expect(corrupt.kv.has(original.blueprintId)).toBe(false);
+        expect([...corrupt.r2.keys()].some(key=>key.startsWith(original.blueprintId+"/"))).toBe(false);
+      }finally{BUNDLED_BLUEPRINTS[0]=original;}
     }
   });
 

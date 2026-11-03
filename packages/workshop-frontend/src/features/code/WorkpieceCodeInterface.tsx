@@ -97,6 +97,7 @@ interface WorkpieceCodeInterfaceProps {
   isAgentActive: boolean
   isVisible?: boolean
   onHasCodeChange?: (hasCode: boolean) => void
+  onRetryConnection?: () => void
   onReviewChat: (chatId: number) => void
 }
 
@@ -212,7 +213,7 @@ function replaceSpanTextChange(
 export default function WorkpieceCodeInterface({
   overseer, summary, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
-  isVisible = true, onHasCodeChange, onReviewChat,
+  isVisible = true, onHasCodeChange, onReviewChat, onRetryConnection,
 }: WorkpieceCodeInterfaceProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
@@ -256,6 +257,9 @@ export default function WorkpieceCodeInterface({
   const contentBaseRef = useRef(contentBase)
   contentBaseRef.current = contentBase
   const reviewBase = chatPin?.mergedCommit ?? acceptedCommit
+  // A replacement reviewed after a mainline update targets the merged head, not the original pin.
+  const reviewBaseRef = useRef(reviewBase)
+  reviewBaseRef.current = reviewBase
 
   // The content base's tree. A failed fetch renders an error state with a retry (the store
   // evicts failures, so bumping the token genuinely refetches); without it the pane would sit
@@ -1370,7 +1374,7 @@ export default function WorkpieceCodeInterface({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height, width: '100%' }}>
-      {summary.type === 'gadget' && summary.commitId && <GadgetCodeUpgrade overseer={overseer} gadgetId={workpieceId} ready={!isEditingLocked && !hasUnsavedChanges} hasChat={branchMode} onCreateReview={async candidate => {
+      {summary.type === 'gadget' && summary.commitId && <GadgetCodeUpgrade overseer={overseer} gadgetId={workpieceId} chatId={selectedChatId} onRetryConnection={onRetryConnection} ready={!isEditingLocked && !hasUnsavedChanges} hasChat={branchMode} onCreateReview={async candidate => {
         if (baseTree === null || treeError !== null) throw new Error('Wait for the current gadget files to finish loading before creating the review.');
         if (candidate.baseCommit !== contentBaseRef.current) throw new Error('The gadget code moved since preview. Preview the upgrade again.');
         const requestIsCurrent = () => upgradeReviewActiveRef.current && workpieceIdRef.current === workpieceId && currentOverseerRef.current === overseer;
@@ -1393,7 +1397,7 @@ export default function WorkpieceCodeInterface({
         if (requestIsCurrent()) onReviewChat(pending.chatId);
       }} onStage={(candidate: GadgetUpgradePreview) => {
         if(isEditingLocked || client === null || client.hasLocalEdits())throw new Error('Wait for this conversation to finish loading and saving.');
-        if(candidate.baseCommit !== contentBaseRef.current)throw new Error('The gadget code moved since preview. Update this conversation from mainline and preview the upgrade again.');
+        if(candidate.baseCommit !== reviewBaseRef.current)throw new Error('The gadget code moved since preview. Update this conversation from mainline and preview the upgrade again.');
         const incoming=new Map(candidate.files),changes:[string,FileChange][]=candidate.files.map(([path,text])=>[path,{set:text}]);
         for(const path of stableDisplayedFiles)if(!incoming.has(path))changes.push([path,{remove:true}]);
         const change:CodeChange={[workpieceId]:changes};validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());

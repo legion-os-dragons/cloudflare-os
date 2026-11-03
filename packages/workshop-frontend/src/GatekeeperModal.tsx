@@ -76,6 +76,7 @@ type ConnectionTypeId =
   | 'ai-model'
   | 'agent-spawner'
   | `resource:${string}:${string}`
+  | `ambient:${string}`
 
 type ConnectionType = {
   id: ConnectionTypeId
@@ -101,6 +102,7 @@ type ConnectionType = {
   // Pin the glyph to a dark color that reads on the light tile in both themes.
   iconColor?: string
   resourceUrlPattern?: string
+  ambientSingleton?:boolean
   // Whether this resource type is independently grantable.
   grantable?: boolean
 }
@@ -174,6 +176,7 @@ function requiredResourceUrlPatterns(connection: ConnectionType): string[] {
 
 function accountSupportsConnection(account: AccountOption, connection: ConnectionType): boolean {
   return account.vendorId === connection.vendorId &&
+    (!connection.ambientSingleton||Boolean(account.vendorDescription.autoProvisionsAccount&&account.description.singleton&&account.supportedResources.length===0))&&
     (!connection.resourceUrlPattern ||
       connection.resourceUrlPattern === 'https://*' ||
       account.supportedResources.some(resource => resource.urlPattern === connection.resourceUrlPattern))
@@ -200,6 +203,9 @@ export default function GatekeeperModal({
   const [reconnectingAccountId, setReconnectingAccountId] = useState<number | null>(null)
   const [accounts, setAccounts] = useState<AccountOption[]>([])
   const [vendors, setVendors] = useState<VendorOption[]>([])
+  const [vendorsLoading, setVendorsLoading] = useState(true)
+  const [accountsLoading, setAccountsLoading] = useState(true)
+  const [accountsError, setAccountsError] = useState(false)
 
   const [availableModels, setAvailableModels] = useState<AiChatAuthorInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string | undefined>()
@@ -246,11 +252,15 @@ export default function GatekeeperModal({
   }, [])
 
   const siteName = useSiteName()
-  const allConnections = useMemo(() => [
+  const allConnections = useMemo<ConnectionType[]>(() => [
     ...platformConnectionTypes(siteName),
     ...vendors.flatMap(vendor => vendor.supportedResources
       .map(resource => connectionForResource(vendor, resource))),
-  ], [siteName, vendors])
+    // Connected accounts are the authority for singleton capabilities. Their discovery does not
+    // depend on the separate URL-resource vendor inventory completing successfully.
+    ...accounts.filter((account,index,all)=>account.vendorDescription.autoProvisionsAccount&&Boolean(account.description.singleton)&&account.supportedResources.length===0&&all.findIndex(candidate=>candidate.vendorId===account.vendorId&&candidate.vendorDescription.autoProvisionsAccount&&Boolean(candidate.description.singleton)&&candidate.supportedResources.length===0)===index)
+      .map(account=>({id:`ambient:${account.vendorId}` as const,vendorId:account.vendorId,groupKey:account.vendorId,groupLabel:account.vendorDescription.displayName,title:account.vendorDescription.displayName,vendor:account.vendorDescription.displayName,description:account.vendorDescription.description??account.vendorDescription.tagline??'Connect this account to the gadget.',ambientSingleton:true})),
+  ], [siteName, vendors,accounts])
 
   const selectedConnection = useMemo(
     () => allConnections.find(connection => connection.id === selectedConnectionId) ?? null,
@@ -358,6 +368,7 @@ export default function GatekeeperModal({
     setConnectingVendor(null)
     setReconnectingAccountId(null)
     setVendors([])
+    setVendorsLoading(true)
     setSelectedAccountId(null)
     updateConfiguratorFrameState(null)
     setConfiguratorLoading(false)
@@ -391,8 +402,10 @@ export default function GatekeeperModal({
     authenticatedApi.listGatekeeperVendors().then(vendors => {
       if (cancelled) return
       setVendors(vendors)
+      setVendorsLoading(false)
     }).catch(err => {
       if (cancelled) return
+      setVendorsLoading(false)
       console.error('Failed to load connection vendors:', err)
       reportIssue('gatekeeper.vendors-load', err)
       toasts.add({ title: "Couldn't load connection options", variant: 'error' })
@@ -407,8 +420,12 @@ export default function GatekeeperModal({
     if (!open) return
     let cancelled = false
     const accountMap = new Map<number, AccountOption>()
+    setAccountsLoading(true)
+    setAccountsError(false)
+    setAccounts([])
 
     const subscriber = new AccountsSubscriberAdapter({
+      ready() { if (!cancelled) setAccountsLoading(false) },
       add({ id, description, vendor, supportedResources, credentialsValid, vendorId }) {
         if (cancelled) return
         accountMap.set(id, { id, description, vendorId, vendorDescription: vendor, supportedResources, credentialsValid })
@@ -420,9 +437,11 @@ export default function GatekeeperModal({
         setAccounts(Array.from(accountMap.values()))
       },
     })
-    const subscription = subscribeConnectedAccounts(authenticatedApi, subscriber)
+    const subscription = subscribeConnectedAccounts(authenticatedApi, subscriber, {includeForcedAutoProvisionedAccounts:true})
     subscription.catch(error => {
       if (cancelled) return
+      setAccountsLoading(false)
+      setAccountsError(true)
       logRpcFailure('Failed to subscribe to connected accounts:', error)
     })
 
@@ -525,6 +544,7 @@ export default function GatekeeperModal({
     const currentIsValid = selectedAccountId !== null
       && matchingAccounts.some(account => account.id === selectedAccountId && account.credentialsValid)
     if (currentIsValid) return
+    if(selectedConnection.ambientSingleton){setSelectedAccountId(null);return;}
     const firstValidAccount = matchingAccounts.find(account => account.credentialsValid)
     setSelectedAccountId(firstValidAccount?.id ?? null)
   }, [selectedConnection, matchingAccounts, selectedAccountId])
@@ -579,6 +599,7 @@ export default function GatekeeperModal({
   const handleSelectConnection = (connection: ConnectionType) => {
     setSelectedConnectionId(connection.id)
     if (!connection.vendorId) return
+    if(connection.ambientSingleton){setSelectedAccountId(null);return;}
     const firstValidAccount = accounts.find(account => account.credentialsValid && accountSupportsConnection(account, connection))
     if (firstValidAccount) setSelectedAccountId(firstValidAccount.id)
     else setSelectedAccountId(null)
@@ -587,8 +608,13 @@ export default function GatekeeperModal({
   const handleConnectAccount = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
-      toasts.add({ title: 'Complete the account connection in the pop-up window.', variant: 'success' })
+      const vendor = vendors.find(candidate => candidate.id === vendorId)
+      if (vendor?.description.autoProvisionsAccount) {
+        await authenticatedApi.provisionAmbientAccount(vendorId)
+      } else {
+        openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
+        toasts.add({ title: 'Complete the account connection in the pop-up window.', variant: 'success' })
+      }
     } catch (error) {
       console.error('Failed to initiate connection:', error)
       reportIssue('gatekeeper.connect-start', error, { gatekeeperVendorId: vendorId })
@@ -709,17 +735,17 @@ export default function GatekeeperModal({
     if (creating) return
     if (!selectedConnection || selectedAccountId === null) return
     const resourceUrlPattern = selectedConnection.resourceUrlPattern
-    if (!resourceUrlPattern) return
+    if (!resourceUrlPattern&&!selectedConnection.ambientSingleton) return
 
     setCreating(true)
     let gatekeeper: RpcStub<GatekeeperClient<any>> | null = null
     let transferred = false
     try {
-      if (!configuratorFrameState?.frame || configuratorFrameState.accountId !== selectedAccountId || configuratorFrameState.resourceUrlPattern !== resourceUrlPattern) {
+      if (!selectedConnection.ambientSingleton&&(!configuratorFrameState?.frame || configuratorFrameState.accountId !== selectedAccountId || configuratorFrameState.resourceUrlPattern !== resourceUrlPattern)) {
         throw new Error('Configurator is not ready.')
       }
-      const resourceUrl = await configuratorCollectResourceUrlRef.current?.()
-      if (!resourceUrl) throw new Error('Configurator did not provide a resource URL.')
+      const resourceUrl = selectedConnection.ambientSingleton?undefined:await configuratorCollectResourceUrlRef.current?.()
+      if (!selectedConnection.ambientSingleton&&!resourceUrl) throw new Error('Configurator did not provide a resource URL.')
       const overseer = await getOverseer()
       gatekeeper = await overseer.newGatekeeper(selectedAccountId, resourceUrl)
       if (gatekeeper) {
@@ -744,6 +770,7 @@ export default function GatekeeperModal({
     if (selectedConnection.id === 'agent-spawner') {
       return Boolean(spawnerDisplayName.trim()) && !spawnerEnvError
     }
+    if(selectedConnection.ambientSingleton)return selectedAccountId!==null&&Boolean(selectedAccount?.credentialsValid);
     if (selectedConnection.resourceUrlPattern) {
       const resourceUrlPattern = selectedConnection.resourceUrlPattern
       return Boolean(
@@ -765,12 +792,12 @@ export default function GatekeeperModal({
       handleCreateAiModel()
     } else if (selectedConnection.id === 'agent-spawner') {
       handleCreateAgentSpawner()
-    } else if (selectedConnection.resourceUrlPattern) {
+    } else if (selectedConnection.resourceUrlPattern||selectedConnection.ambientSingleton) {
       handleCreateResourceConnection()
     }
   }
 
-  const createLabel = selectedConnection?.resourceUrlPattern
+  const createLabel = selectedConnection?.resourceUrlPattern||selectedConnection?.ambientSingleton
     ? 'Add connection'
     : 'Create connection'
 
@@ -892,11 +919,13 @@ export default function GatekeeperModal({
             </div>
 
             <div className="new-gatekeeper-scroll min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              {(vendorsLoading || accountsLoading) && <p role="status" className="pb-3 text-[13px] text-kumo-subtle">Loading services and connected accounts…</p>}
+              {accountsError && <p role="status" className="pb-3 text-[13px] text-kumo-subtle">Connected accounts could not be loaded. Reopen this picker to retry.</p>}
               <div className="overflow-hidden rounded-xl border border-kumo-line bg-kumo-base">
                 {isSearching ? (
                   filteredConnections.length === 0 ? (
                     <div className="px-4 py-8 text-center text-[13px] leading-[18px] font-normal tracking-[-0.25px] text-kumo-subtle">
-                      No matching connection types.
+                      {vendorsLoading || accountsLoading ? 'Checking connection options…' : 'No matching connection types.'}
                     </div>
                   ) : filteredConnections.map((connection, index) => (
                     <ConnectionTypeRow
@@ -909,7 +938,7 @@ export default function GatekeeperModal({
                 ) : (
                   groupedConnections.length === 0 ? (
                     <div className="px-4 py-8 text-center text-[13px] leading-[18px] font-normal tracking-[-0.25px] text-kumo-subtle">
-                      No connection types available.
+                      {vendorsLoading || accountsLoading ? 'Checking connection options…' : 'No connection types available.'}
                     </div>
                   ) : groupedConnections.map((group, index) => (
                     <ConnectionGroupRow

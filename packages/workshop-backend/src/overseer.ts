@@ -1,6 +1,10 @@
+import type {GadgetAlarmScheduler,GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
 import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
+import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
 import type {GadgetUpgradeSource, GadgetUpgradePreview} from '@gadgets/workshop-shared/api';
 import { gadgetAccessHash, assertGadgetAccess, guardGadgetExport } from "./gadget-access";
+import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,requireCapabilityJson,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
+import {GADGET_ALARM_BINDING,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
@@ -8,7 +12,7 @@ import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, Work
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import { type AgentCatalog, Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
+import { type AgentCatalog, type GatekeeperContext, type GatekeeperAlarmScheduler, Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -286,6 +290,7 @@ function gatekeeperVendorId(record: GatekeeperRecord | undefined): string | unde
 // GadgetRecord.bindings keyed by binding name.
 type BindingRecord = {
   target: WorkpieceId;
+  capability?: GadgetCapabilitySpec & {generation:string;producerRevision:number;consumerRevision:number;grantedBy:string};
 
   // User-provided metadata for how this binding should appear in blueprints. Absence means not
   // yet configured. This lives on the edge, not on the gatekeeper: two gadgets binding the same
@@ -463,6 +468,10 @@ export type WorktreeRecord = {
  */
 export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
+function unlockedGadgetTitle(record:WorkpieceRecord|undefined):string|undefined{
+  return record?.type==='gadget'&&!record.accessKeyHash?record.title:undefined;
+}
+
 // Produce a valid, unused binding name from a suggested base name: sanitized to identifier
 // characters (uppercased, in keeping with the ALL_CAPS convention), then suffixed _2/_3/...
 // until it passes validateBindingName and isn't taken. Used wherever a name is needed and the
@@ -614,6 +623,7 @@ function describeBindingKind(binding: BlueprintBinding): string {
     case "gatekeeper": return `external resource: ${binding.gatekeeperName}`;
     case "aiModel": return `AI model`;
     case "agentSpawner": return `agent spawner`;
+    case 'gadgetCapability':return `${binding.capability.kind} gadget port: ${binding.capability.port}`;
     default: return binding satisfies never;
   }
 }
@@ -1095,6 +1105,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
+      // Private per-producer secrets for native command bridges; never blueprint/binding data.
+      gadgetCapabilityBridgeTokens: {} as Record<number, string>,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.
@@ -1243,6 +1255,14 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
             return record.bindingName ?? null;
           }
         }
+      }),
+
+      gadgetContinuations: collection<{id: number; at: number; requestId: string; claim?: string; attempts?: number}>()({
+        primaryKey: "id",
+      }),
+
+      gatekeeperContinuations: collection<{id: number; at: number; claim?: string}>()({
+        primaryKey: "id",
       }),
 
       gatekeepers: collection<GatekeeperRecord>()({
@@ -1644,6 +1664,7 @@ class OverseerImpl implements AgentHooks {
 
   // True while alarm() runs (see runAlarmTasks); #updateAlarm defers to its end.
   #inAlarmHandler = false;
+  #continuationWake: (() => void) | undefined;
 
   // Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls).
   #pendingCallDrains = new Map<number, Promise<void>>();
@@ -1843,7 +1864,7 @@ class OverseerImpl implements AgentHooks {
   #updateAlarm(): void {
     if (this.#inAlarmHandler) return;
 
-    let times: number[] = [];
+    let times: number[] = [...this.storage.gatekeeperContinuations.list(), ...this.storage.gadgetContinuations.list()].map(row => row.at);
 
     // Outstanding agent work: see #agentKeepAliveTime for why it is set once and held.
     let hasAgentWork = this.#runningAgents.size > 0 ||
@@ -1889,11 +1910,36 @@ class OverseerImpl implements AgentHooks {
     this.#inAlarmHandler = true;
     try {
       do {
-        let results = await Promise.allSettled([
+        let settled = false;
+        const concerns = Promise.allSettled([
           this.waitForAllAgentsToComplete(),
           this.drainAllPendingAgentCalls(),
           this.deliverReadyExternalMessageResponses(),
-        ]);
+        ]).finally(() => { settled = true; });
+        // A long agent turn holds this physical alarm open. Pump retained facet
+        // deadlines alongside it instead of starving them until the turn ends.
+        for (;;) {
+          await this.runGatekeeperContinuations();
+          await this.runGadgetContinuations();
+          if (settled) break;
+          const deadlines = [...this.storage.gatekeeperContinuations.list(), ...this.storage.gadgetContinuations.list()].map(row => row.at);
+          const delay = Math.max(1000, Math.min(30000, ...deadlines.map(at => at - Date.now())));
+          let wake: (() => void) | undefined;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const next = new Promise<void>(resolve => {
+              wake = resolve;
+              this.#continuationWake = resolve;
+              timer = setTimeout(resolve, delay);
+            });
+            await Promise.race([concerns, next]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+            if (this.#continuationWake === wake) this.#continuationWake = undefined;
+          }
+          if (settled) break;
+        }
+        const results = await concerns;
         for (let result of results) {
           if (result.status === "rejected") throw result.reason;
         }
@@ -2617,6 +2663,298 @@ class OverseerImpl implements AgentHooks {
         ([, edge]) => !edge.pending || edge.pending.chatId === forChatId);
   }
 
+  async getCapabilityExports(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+  ): Promise<GadgetCapabilityExports> {
+    const gadget = this.getGadgetRecord(gadgetId);
+    if (gadget.accessKeyHash)
+      throw Error("Key-locked gadgets cannot export workspace connections.");
+    return takeCapabilityExports(await this.loadGadgetWorker(gadgetId, chatId)
+      .getEntrypoint<GadgetCapabilityHandler>("CapabilityHandler")
+      .describe());
+  }
+
+  private async authorizeGadgetCommandBuild(userId: string): Promise<void> {
+    if (!this.ownerId) throw Error("Unauthorized: workspace has been deleted.");
+    if (userId === this.ownerId) return;
+    const user = this.users.get(this.users.idFromString(userId));
+    const profile = await user.whoami();
+    const role = await this.authorizeCollaborator(profile.id, user, {requireRole: "build"});
+    // Verification awaits external resources; a downgrade during it must not retain old authority.
+    const sharing = await this.getSharingManager();
+    if (role !== "build" || sharing.getEffectiveRole(profile.id) !== "build")
+      throw Error("Unauthorized: gadget commands require current build access.");
+  }
+
+  // Build-only callers may invoke their own producer without creating a cyclic self-binding.
+  async executeGadgetCapability(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
+      request: GadgetCapabilityJson, grantedBy: string, chatId?: number): Promise<GadgetCapabilityJson> {
+    if (spec.kind !== "command") throw Error("Only a declared command port may be executed.");
+    requireCapabilityJson(request);
+    await this.authorizeGadgetCommandBuild(grantedBy);
+    using _commandSession = {[Symbol.dispose]: this.joinSession(grantedBy === this.ownerId ? "owner" : "build")};
+    const revision = this.getGadgetRecord(gadgetId).accessRevision ?? 0;
+    const authorize = () => {
+      if ((this.getGadgetRecord(gadgetId).accessRevision ?? 0) !== revision)
+        throw Error("This gadget command authority has been revoked.");
+    };
+    const handler = this.loadGadgetWorker(gadgetId, chatId).getEntrypoint<GadgetCapabilityHandler>("CapabilityHandler");
+    requireCapabilityExport(takeCapabilityExports(await handler.describe()), spec);
+    authorize();
+    const source = await this.getGadgetFacetFetcher(gadgetId, chatId);
+    try {
+      await this.authorizeGadgetCommandBuild(grantedBy);
+      authorize();
+      const result = takeCapabilityJson(await handler.command(source, spec.port, request, {
+        workspaceId: this.ctx.id.toString(), consumerGadgetId: gadgetId, producerGadgetId: gadgetId, grantedBy,
+      }));
+      await this.authorizeGadgetCommandBuild(grantedBy);
+      authorize();
+      return result;
+    } finally { disposeCapabilityResult(source); }
+  }
+
+  async executeGadgetCommand(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
+      request: GadgetCapabilityJson, chatId: number): Promise<GadgetCapabilityJson> {
+    const grantedBy = this.storage.activeAgents.get(chatId)?.initiatorUserId;
+    if (!grantedBy) throw Error("No authenticated agent turn can execute a gadget command.");
+    const target = this.resolveWorkpieceRoot(gadgetId, true, chatId).workpieceId;
+    return this.executeGadgetCapability(target, spec, request, grantedBy, chatId);
+  }
+
+  async bindGadgetCapability(
+    gadgetId: WorkpieceId,
+    name: string,
+    target: WorkpieceId,
+    spec: GadgetCapabilitySpec,
+    grantedBy: string,
+    chatId?: number,
+  ): Promise<void> {
+    validateBindingName(name);
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING)
+      throw Error("This binding name is reserved.");
+    const producer = this.getGadgetRecord(target),
+      consumer = this.getGadgetRecord(gadgetId);
+    const producerRevision = producer.accessRevision ?? 0,
+      consumerRevision = consumer.accessRevision ?? 0;
+    if (producer.pending && producer.pending.chatId !== chatId)
+      throw Error("The producer gadget is not available to this chat.");
+    if (consumer.bindings[name]) throw Error(`There is already a binding named "${name}".`);
+    const seen = new Set<WorkpieceId>();
+    const reaches = (id: WorkpieceId): boolean => {
+      if (id === gadgetId) return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      const record = this.storage.gadgets.get(id);
+      return (
+        record?.type === "gadget" &&
+        Object.values(record.bindings).some((edge) => edge.capability && reaches(edge.target))
+      );
+    };
+    if (reaches(target)) throw Error("Gadget capability connections cannot form a cycle.");
+    requireCapabilityExport(await this.getCapabilityExports(target, chatId), spec);
+    // Declaration reads yield; preserve exactly the authority that was reviewed.
+    const latestProducer = this.getGadgetRecord(target),
+      latestConsumer = this.getGadgetRecord(gadgetId);
+    seen.clear();
+    if (
+      latestProducer.accessKeyHash ||
+      (latestProducer.pending && latestProducer.pending.chatId !== chatId) ||
+      (latestProducer.accessRevision ?? 0) !== producerRevision ||
+      (latestConsumer.accessRevision ?? 0) !== consumerRevision ||
+      latestConsumer.bindings[name] ||
+      reaches(target)
+    )
+      throw Error("Gadget connection changed while granting access.");
+    const useScopeBefore=this.#accountRequiringUseScope();
+    latestConsumer.bindings[name] = {
+      target,
+      capability: {
+        ...spec,
+        generation: crypto.randomUUID(),
+        producerRevision,
+        consumerRevision,
+        grantedBy,
+      },
+      ...(chatId === undefined ? {} : { pending: { chatId } }),
+    };
+    this.storage.gadgets.put(latestConsumer);
+    this.bumpVersion([gadgetId]);
+    this.#restartIfUseScopeWidened(useScopeBefore,'Gadget restarted because a producer capability was connected.');
+    if (spec.kind === "command")
+      this.#restartIfSessionsAffected("Gadget restarted because a privileged command was connected.", "use");
+  }
+
+  #capabilitySubscriptions = new Set<{
+    consumer: WorkpieceId;
+    producer: WorkpieceId;
+    name: string;
+    dispose: () => void;
+    revoke: () => void;
+  }>();
+  #connectionEpoch = crypto.randomUUID();
+  revokeGadgetConnectionSessions(): void {
+    this.#connectionEpoch = crypto.randomUUID();
+    for (const lease of this.#capabilitySubscriptions) lease.revoke();
+  }
+  revokeGadgetConnections(id: WorkpieceId, name?: string): void {
+    for (const lease of this.#capabilitySubscriptions)
+      if (
+        (lease.consumer === id && (name === undefined || lease.name === name)) ||
+        (name === undefined && lease.producer === id)
+      )
+        lease.revoke();
+  }
+
+  openGadgetCapability(
+    gadgetId: WorkpieceId,
+    name: string,
+    generation: string,
+    chatId?: number,
+  ): NativeRpcTarget {
+    const initial = this.getGadgetRecord(gadgetId).bindings[name];
+    if (!initial?.capability) throw Error("No such gadget capability connection.");
+    const grant = initial.capability;
+    const sessionEpoch = this.#connectionEpoch;
+    const identity = () => ({
+      workspaceId: this.ctx.id.toString(),
+      producerGadgetId: initial.target,
+      generation,
+      port: grant.port,
+      kind: grant.kind,
+      protocol: grant.protocol,
+    });
+    const authorize = () => {
+      const consumer = this.getGadgetRecord(gadgetId),
+        edge = consumer.bindings[name],
+        producer = this.getGadgetRecord(initial.target);
+      if (
+        sessionEpoch !== this.#connectionEpoch ||
+        edge?.capability?.generation !== generation ||
+        edge.target !== initial.target ||
+        (edge.pending && edge.pending.chatId !== chatId) ||
+        producer.accessKeyHash ||
+        (consumer.accessRevision ?? 0) !== grant.consumerRevision ||
+        (producer.accessRevision ?? 0) !== grant.producerRevision
+      )
+        throw Error("This gadget connection has been revoked.");
+    };
+    const connect = async () => {
+      authorize();
+      const handler = this.loadGadgetWorker(
+        initial.target,
+        chatId,
+      ).getEntrypoint<GadgetCapabilityHandler>("CapabilityHandler");
+      requireCapabilityExport(takeCapabilityExports(await handler.describe()), grant);
+      authorize();
+      const gadget = await this.getGadgetFacetFetcher(initial.target, chatId);
+      authorize();
+      return { handler, gadget };
+    };
+    if (grant.kind === "command")
+      return new GadgetCommandBroker(
+        authorize,
+        async (request) => {
+          const { handler, gadget: source } = await connect();
+          try {
+            return takeCapabilityJson(
+              await handler.command(source, grant.port, request, {
+                workspaceId: this.ctx.id.toString(),
+                consumerGadgetId: gadgetId,
+                producerGadgetId: initial.target,
+                grantedBy: grant.grantedBy,
+              }),
+            );
+          } finally {
+            disposeCapabilityResult(source);
+          }
+        },
+        identity,
+      );
+    return new GadgetProjectionBroker(
+      authorize,
+      async (request) => {
+        const { handler, gadget: source } = await connect();
+        try {
+          return takeCapabilityJson(await handler.project(source, grant.port, request));
+        } finally {
+          disposeCapabilityResult(source);
+        }
+      },
+      async (request, observer) => {
+        const observerCopy = observer.dup();
+        let upstream: NativeRpcStub<NativeRpcTarget> | undefined;
+        let disposed = false;
+        let terminal: Promise<unknown> | undefined;
+        const lease = {
+          consumer: gadgetId,
+          producer: initial.target,
+          name,
+          revoke: () => {
+            if (disposed) return;
+            try {
+              terminal = observerCopy
+                .unavailable("Gadget connection revoked. Reconnect to read current data.")
+                .catch(() => {});
+            } catch {
+              terminal = Promise.resolve();
+            }
+            lease.dispose();
+          },
+          dispose: () => {
+            if (disposed) return;
+            disposed = true;
+            this.#capabilitySubscriptions.delete(lease);
+            try {
+              upstream?.[Symbol.dispose]();
+            } catch {
+              /* A failed producer cleanup cannot preserve authority. */
+            }
+            if (terminal) void terminal.finally(() => observerCopy[Symbol.dispose]());
+            else observerCopy[Symbol.dispose]();
+          },
+        };
+        const forward = new NativeRpcStub(
+          new GadgetRevisionObserver(async (revision: string) => {
+            try {
+              authorize();
+              if (disposed) throw Error("Subscription disposed.");
+              if (typeof revision !== "string" || revision.length > 512)
+                throw Error("Invalid gadget revision.");
+              await observerCopy.changed(revision);
+              authorize();
+            } catch (error) {
+              lease.revoke();
+              throw error;
+            }
+          }),
+        );
+        try {
+          const { handler, gadget: source } = await connect();
+          try {
+            upstream = await handler.watch(source, grant.port, request, forward);
+          } finally {
+            disposeCapabilityResult(source);
+          }
+          authorize();
+          if (disposed) {
+            upstream[Symbol.dispose]();
+            throw Error("Subscription revoked while connecting.");
+          }
+          this.#capabilitySubscriptions.add(lease);
+          return new NativeRpcStub(new GadgetConnectionLease(lease.dispose));
+        } catch (error) {
+          lease.dispose();
+          throw error;
+        } finally {
+          forward[Symbol.dispose]();
+        }
+      },
+      identity,
+    );
+  }
+
   // Bind `target` (a gatekeeper) into gadget `gadgetId`'s env under `name`. If `chatId` is
   // given, the edge is provisional to that chat (see BindingRecord.pending); the caller is
   // responsible for getting the addition recorded in the chat log so the pending edge gets
@@ -2624,7 +2962,7 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME) {
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING) {
       throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
@@ -2679,6 +3017,7 @@ class OverseerImpl implements AgentHooks {
       throw new Error(`No such binding: ${name}`);
     }
     delete gadget.bindings[name];
+    this.revokeGadgetConnections(gadgetId,name);
     this.storage.gadgets.put(gadget);
     this.bumpVersion([gadgetId]);
   }
@@ -2692,7 +3031,7 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET" || newName === GIT_BINDING_NAME) {
+    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN || newName === GADGET_ALARM_BINDING) {
       throw new Error(`The binding name \`${newName}\` is reserved.`);
     }
     if (gadget.bindings[newName]) {
@@ -2700,6 +3039,7 @@ class OverseerImpl implements AgentHooks {
     }
 
     delete gadget.bindings[oldName];
+    this.revokeGadgetConnections(gadgetId,oldName);
     gadget.bindings[newName] = edge;
     this.storage.gadgets.put(gadget);
     this.bumpVersion([gadgetId]);
@@ -2726,8 +3066,11 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
+    this.revokeGadgetConnections(id);
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
+    this.storage.gadgetContinuations.delete(id);
+    this.#updateAlarm();
     this.#runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
   }
@@ -3495,6 +3838,10 @@ class OverseerImpl implements AgentHooks {
       target,
       caller,
     };
+    if(target.type==='gadgetCapability'){
+      const edge=this.getGadgetRecord(target.gadgetId).bindings[target.name];
+      return edge?.capability?.kind==='projection'?this.ctx.exports.GadgetProjectionLoopback({props}):this.ctx.exports.GadgetCommandLoopback({props});
+    }
     return this.ctx.exports.GatekeeperLoopback({props});
   }
 
@@ -3513,8 +3860,19 @@ class OverseerImpl implements AgentHooks {
     // describing a gadget's bindings (see describeBinding in agent.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
-      env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
+      env[name] = this.makeBindingLoopback(edge.capability?{type:'gadgetCapability',gadgetId,name,generation:edge.capability.generation,epoch:this.#connectionEpoch}:{type: "gatekeeper", id: edge.target}, caller);
     }
+    const tokens = this.storage.gadgetCapabilityBridgeTokens.get();
+    if (!tokens[gadgetId]) {
+      tokens[gadgetId] = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
+      this.storage.gadgetCapabilityBridgeTokens.put(tokens);
+    }
+    // Last, so even legacy bindings cannot shadow the producer's native-only bridge key.
+    env[GADGET_CAPABILITY_BRIDGE_TOKEN] = tokens[gadgetId];
+    env[GADGET_ALARM_BINDING] = this.ctx.exports.GadgetAlarmLoopback({props: {
+      overseerId: this.ctx.id.toString(), gadgetId, accessRevision: gadget.accessRevision ?? 0,
+      ...(forChatId === undefined ? {} : {chatId: forChatId}),
+    }});
     return env;
   }
 
@@ -3589,6 +3947,7 @@ class OverseerImpl implements AgentHooks {
   proposedChangesChanged(chatId: number) {
     for (let [gadgetId, runningChatId] of this.#runningChatIds) {
       if (runningChatId === chatId) {
+        this.revokeGadgetConnections(gadgetId);
         this.ctx.facets.abort(this.gadgetFacetName(gadgetId), new Error(
             "Gadget restarted because the proposed changes changed."));
       }
@@ -5022,6 +5381,9 @@ class OverseerImpl implements AgentHooks {
   // changes.)
   loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number): WorkerStub {
     let codeVersion = `${this.storage.codeVersion.get()}`;
+    // Worker definitions capture sealed binding props. A cold overseer or an
+    // authorization restart must never reuse a consumer's old connection epoch.
+    if(Object.values(this.getGadgetRecord(gadgetId).bindings).some(edge=>edge.capability))codeVersion+=`.${this.#connectionEpoch}`;
     let sequence: number | undefined;
     // Snapshotted in the same synchronous step as the cache key's sequence: the loader callback
     // runs asynchronously, and buildChatDoc's as-of-`sequence` reconstruction needs the
@@ -5075,8 +5437,21 @@ class OverseerImpl implements AgentHooks {
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
         ],
-        mainModule: "server.js",
-        modules,
+        // alarm() is a native reserved RPC method. Invoke it locally through a sealed wrapper.
+        mainModule: "__kernel_gadget_alarm.js",
+        modules: {...modules, "__kernel_gadget_alarm.js": `
+export * from "./server.js";
+import {Gadget as AuthoredGadget} from "./server.js";
+export class Gadget extends AuthoredGadget {
+  #alarmToken;
+  constructor(ctx, env) { super(ctx, env); this.#alarmToken = env.GADGET_CAPABILITY_BRIDGE_TOKEN; }
+  async __runKernelAlarm(token) {
+    if (!this.#alarmToken || token !== this.#alarmToken) throw Error("Unauthorized gadget alarm dispatch.");
+    if (typeof this.alarm !== "function") throw Error("This gadget does not implement alarm().");
+    await this.alarm();
+  }
+}
+`},
         env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
         globalOutbound: null,
 
@@ -5149,6 +5524,7 @@ class OverseerImpl implements AgentHooks {
     let oldChat = this.#runningChatIds.get(gadgetId);
     let newChat = chatId ?? null;
     if (newChat !== oldChat) {
+      this.revokeGadgetConnections(gadgetId);
       this.ctx.facets.abort(facetName, new Error(
           newChat === null
             ? "Gadget restarted to switch back to main version."
@@ -5166,6 +5542,29 @@ class OverseerImpl implements AgentHooks {
     });
   }
 
+  // UI-only shares do not carry a builder's stored financial command authority. Gadget roots
+  // expose arbitrary methods, so they cannot be soundly filtered into reads and writes.
+  // Only projection-connected roots may be shared with use-role collaborators.
+  assertGadgetUseWithoutCommands(gadgetId: WorkpieceId): void {
+    const visited = new Set<WorkpieceId>();
+    const pending = [gadgetId];
+    while (pending.length) {
+      const id = pending.pop()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const record = this.storage.gadgets.get(id);
+      if (record?.type !== "gadget") continue;
+      for (const [, edge] of this.visibleBindings(record)) {
+        if (edge.capability?.kind === "command")
+          throw Error(
+            "Unauthorized: privileged command connections require build access. " +
+            "Share a separate projection-only gadget for UI-only access.",
+          );
+        if (edge.capability) pending.push(edge.target);
+      }
+    }
+  }
+
   // Get an RpcStub for the gadget facet, which can be returned to the client.
   //
   // `joinAs` counts the returned stub toward #hasCollaboratorSession for its own lifetime, like
@@ -5180,7 +5579,16 @@ class OverseerImpl implements AgentHooks {
   // look like an RpcTarget instead.
   async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionKind)
       : Promise<RpcStub<any>> {
+    if (joinAs === "use") this.assertGadgetUseWithoutCommands(gadgetId);
     let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
+    if (joinAs === "use") {
+      try {
+        this.assertGadgetUseWithoutCommands(gadgetId);
+      } catch (error) {
+        disposeCapabilityResult(facet);
+        throw error;
+      }
+    }
     let leaveSession = joinAs ? this.joinSession(joinAs) : undefined;
 
     let self = this;
@@ -5417,7 +5825,8 @@ class OverseerImpl implements AgentHooks {
     // happen long after the session that queued it, so the queue-time stub is gone) -- the
     // binding that makes buildPack() serve exactly this action's pending-push closure.
     await gatekeeper.applyAction(record.action,
-        new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+        new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id),
+        this.gatekeeperContext(record.gatekeeperId));
     record.state = "approved";
     record.appliedAt = new Date();
     record.resolvedBy = resolvedBy;
@@ -5611,11 +6020,129 @@ class OverseerImpl implements AgentHooks {
 
     this.ctx.facets.delete(`gatekeeper${id}`);
     this.storage.gatekeepers.delete(id);
+    this.storage.gatekeeperContinuations.delete(id);
+    this.#updateAlarm();
+  }
+
+  gatekeeperContext(id: number): GatekeeperContext {
+    if (!this.storage.gatekeepers.get(id)) throw new Error("No such gatekeeper.");
+    return {alarms: this.ctx.exports.GatekeeperAlarmLoopback({props: {
+      overseerId: this.ctx.id.toString(), gatekeeperId: id,
+    }})};
+  }
+
+  gatekeeperAlarm(id: number): number | null {
+    this.assertGatekeeperUsable(id);
+    if (!this.storage.gatekeepers.get(id)) throw new Error("No such gatekeeper.");
+    const deadline = this.storage.gatekeeperContinuations.get(id);
+    // The recovery claim is not a requested continuation: callers must explicitly
+    // re-arm their next deadline before a successful delivery clears the claim.
+    return deadline && !deadline.claim ? deadline.at : null;
+  }
+
+  setGatekeeperAlarm(id: number, timestamp: number | null): void {
+    this.gatekeeperAlarm(id);
+    if (timestamp === null) this.storage.gatekeeperContinuations.delete(id);
+    else {
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > Date.now() + 366 * 86400000) {
+        throw new TypeError("Invalid gatekeeper continuation deadline.");
+      }
+      this.storage.gatekeeperContinuations.put({id, at: Math.max(Date.now() + 1000, timestamp)});
+    }
+    this.#continuationWake?.();
+    this.#updateAlarm();
+  }
+
+  async runGatekeeperContinuations(): Promise<void> {
+    const due = [...this.storage.gatekeeperContinuations.list()]
+      .filter(row => row.at <= Date.now()).toSorted((a, b) => a.at - b.at || a.id - b.id).slice(0, 4);
+    for (const row of due) {
+      // A prior facet await can let another caller cancel or postpone this wake.
+      const current = this.storage.gatekeeperContinuations.get(row.id);
+      if (!current || current.at !== row.at || current.claim !== row.claim || current.at > Date.now()) continue;
+      if (!this.storage.gatekeepers.get(row.id)) {
+        this.storage.gatekeeperContinuations.delete(row.id);
+        continue;
+      }
+      // Replace the consumed deadline with recovery before crossing a facet await.
+      // A root eviction must not strand previously approved durable work.
+      const claim = crypto.randomUUID();
+      this.storage.gatekeeperContinuations.put({id: row.id, at: Date.now() + 300000, claim});
+      try {
+        this.assertGatekeeperUsable(row.id);
+        const facet = this.getGatekeeperFacet(row.id) as
+          Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "continueProcessing">>>;
+        await facet.continueProcessing(this.gatekeeperContext(row.id));
+        if (this.storage.gatekeeperContinuations.get(row.id)?.claim === claim) {
+          this.storage.gatekeeperContinuations.delete(row.id);
+        }
+      } catch {
+        if (this.storage.gatekeepers.get(row.id) && !this.storage.gatekeeperContinuations.get(row.id)) {
+          this.storage.gatekeeperContinuations.put({id: row.id, at: Date.now() + 300000});
+        }
+      }
+    }
+  }
+
+  /** Validate the sealed lifecycle capability against its gadget's current access revision. */
+  gadgetAlarm(id: number, accessRevision: number): number | null {
+    const gadget = this.getGadgetRecord(id);
+    if ((gadget.accessRevision ?? 0) !== accessRevision) throw Error("This gadget alarm capability was revoked.");
+    const deadline = this.storage.gadgetContinuations.get(id);
+    return deadline && !deadline.claim ? deadline.at : null;
+  }
+
+  /** Preview code cannot schedule durable execution until accepted. */
+  setGadgetAlarm(id: number, accessRevision: number, timestamp: number | null, chatId?: number): void {
+    this.gadgetAlarm(id, accessRevision);
+    if (chatId !== undefined || this.getGadgetRecord(id).pending)
+      throw Error("Accept this gadget's code before scheduling durable alarms.");
+    if (timestamp === null) this.storage.gadgetContinuations.delete(id);
+    else {
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > Date.now() + 366 * 86400000)
+        throw new TypeError("Invalid gadget alarm deadline.");
+      this.storage.gadgetContinuations.put({id, at: Math.max(Date.now() + 1000, timestamp), requestId: crypto.randomUUID()});
+    }
+    this.#continuationWake?.();
+    this.#updateAlarm();
+  }
+
+  /** Bounded mainline delivery, retaining a durable recovery lease before crossing a facet await. */
+  async runGadgetContinuations(): Promise<void> {
+    const due = [...this.storage.gadgetContinuations.list()]
+      .filter(row => row.at <= Date.now()).toSorted((a,b) => a.at-b.at || a.id-b.id).slice(0,4);
+    for (const row of due) {
+      const current = this.storage.gadgetContinuations.get(row.id);
+      if (!current || current.requestId !== row.requestId || current.at !== row.at || current.claim !== row.claim) continue;
+      const record = this.storage.gadgets.get(row.id);
+      if (!record || record.type !== "gadget" || record.pending) { this.storage.gadgetContinuations.delete(row.id); continue; }
+      const attempts = (row.attempts ?? 0) + 1;
+      if (attempts > 6) { this.storage.gadgetContinuations.delete(row.id); continue; }
+      const claim = crypto.randomUUID();
+      this.storage.gadgetContinuations.put({...row, at: Date.now()+300000, attempts, claim});
+      let facet: Fetcher<DurableObject> | undefined;
+      try {
+        facet = await this.getGadgetFacetFetcher(row.id);
+        const token = this.storage.gadgetCapabilityBridgeTokens.get()[row.id];
+        await (facet as Fetcher<DurableObject & {__runKernelAlarm(token: string): Promise<void>}>).__runKernelAlarm(token);
+        if (this.storage.gadgetContinuations.get(row.id)?.claim === claim) this.storage.gadgetContinuations.delete(row.id);
+      } catch {
+        // An explicit cancellation or re-arm made by the callback wins over recovery.
+        if (this.storage.gadgetContinuations.get(row.id)?.claim === claim) {
+          if (attempts >= 6) this.storage.gadgetContinuations.delete(row.id);
+          else this.storage.gadgetContinuations.put({id: row.id, at: Date.now()+Math.min(300000,1000*2**attempts), requestId: row.requestId, attempts});
+        }
+        this.logger.warn("gadget alarm delivery failed", {event: "gadget.alarm.failed", gadgetId: String(row.id)});
+      } finally { if (facet) disposeCapabilityResult(facet); }
+    }
   }
 
   // Open the session behind a binding loopback.
   startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
     switch (target.type) {
+      case 'gadgetCapability':
+        if(target.epoch!==this.#connectionEpoch)throw Error('This gadget connection session has been revoked. Reconnect.');
+        return Promise.resolve(this.openGadgetCapability(target.gadgetId,target.name,target.generation,'chatId'in caller?caller.chatId:undefined));
       case "gadget": {
         if (caller.from === "agent") {
           if (this.getGadgetRecord(target.id).accessKeyHash && this.storage.chatContext.get(caller.chatId)?.spawnerConfig) {
@@ -6370,6 +6897,7 @@ class OverseerImpl implements AgentHooks {
         .filter(record => record.type === "gadget")  // worktrees have no facet to restart
         .map(gadget => gadget.id);
     for (let id of ids) {
+      this.revokeGadgetConnections(id);
       this.ctx.facets.abort(this.gadgetFacetName(id),
           new Error("Gadget restarted due to code update."));
     }
@@ -6404,6 +6932,7 @@ class OverseerImpl implements AgentHooks {
   //   Without the delay their own removeCollaborator()/revokeShareLink() call might reject with a
   //   connection error even though it succeeded.
   async scheduleAccessRestart(reason: string): Promise<void> {
+    this.revokeGadgetConnectionSessions();
     await this.ctx.storage.sync();
     await scheduler.wait(100);
     this.ctx.abort(reason);
@@ -6453,7 +6982,7 @@ class OverseerImpl implements AgentHooks {
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return facet.startSession(new ApprovalQueueImpl(this, id, caller));
+    return facet.startSession(new ApprovalQueueImpl(this, id, caller), this.gatekeeperContext(id));
   }
 
   // Sessions are authorized and verified only at open(), so widening what a live session's holder
@@ -7117,8 +7646,14 @@ class OverseerImpl implements AgentHooks {
   // Add a binding edge to a gadget on behalf of the agent's setGadgetBinding tool. The edge is
   // provisional to the chat (see BindingRecord.pending); the agent loop records the addition in
   // the chat log via `addedBindings`, which sequence-stamps it (see addChatMessages()).
-  addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
-                   chatId: number): void {
+  async addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
+                   chatId: number,capability?:GadgetCapabilitySpec):Promise<void> {
+    if(capability){
+      const grantedBy=this.storage.activeAgents.get(chatId)?.initiatorUserId;
+      if(!grantedBy)throw Error('No authenticated agent turn can grant this connection.');
+      const gadget=this.getGadgetRecord(this.resolveWorkpieceRoot(gadgetId,true,chatId).workpieceId);
+      return this.bindGadgetCapability(gadget.id,name,target,capability,grantedBy,chatId);
+    }
     if (!this.storage.gatekeepers.get(target)) {
       throw new Error("This resource is no longer available.");
     }
@@ -7623,8 +8158,9 @@ class OverseerImpl implements AgentHooks {
       output: gadget.output,
       bindings: this.visibleBindings(gadget, forChatId).map(([name, edge]) => ({
         name,
-        title: this.storage.gatekeepers.get(edge.target)?.resourceTitle || "(title unavailable)",
+        title: this.storage.gatekeepers.get(edge.target)?.resourceTitle || unlockedGadgetTitle(this.storage.gadgets.get(edge.target)) || "(title unavailable)",
         target: edge.target,
+        ...(edge.capability?{capability:{port:edge.capability.port,kind:edge.capability.kind,protocol:edge.capability.protocol}}:{}),
       })),
     }));
   }
@@ -8200,6 +8736,11 @@ class OverseerImpl implements AgentHooks {
     }> = [];
 
     for (let [bindingName, edge] of edges) {
+      if(edge.capability){
+        const producer=this.storage.gadgets.get(edge.target);
+        if(producer?.type==='gadget'&&!producer.accessKeyHash)bindings[bindingName]={type:'gadgetCapability',title:producer.title,description:'Optional same-workspace gadget connection.',optional:true,capability:{port:edge.capability.port,kind:edge.capability.kind,protocol:edge.capability.protocol}};
+        continue;
+      }
       let gk = this.storage.gatekeepers.get(edge.target);
       if (!gk) continue;  // dangling edge (gatekeeper destroyed)
 
@@ -9203,6 +9744,9 @@ class OverseerImpl implements AgentHooks {
           case "agentSpawner":
             details = `an agent-spawner binding`;
             break;
+          case 'gadgetCapability':
+            details=`a same-workspace ${binding.capability.kind} gadget port ${JSON.stringify(binding.capability.port)} using ${JSON.stringify(binding.capability.protocol)}; wire with setGadgetBinding capability, or leave disconnected when optional`;
+            break;
           default:
             binding satisfies never;
             details = `unknown`;
@@ -9317,7 +9861,12 @@ class OverseerImpl implements AgentHooks {
     // this closure must learn about accepted requests too.
     let pending = [...ids];
     while (pending.length > 0) {
-      let spec = this.storage.gatekeepers.get(pending.pop()!)?.creationSpec;
+      const id=pending.pop()!;
+      const producer=this.storage.gadgets.get(id);
+      if(producer?.type==='gadget'&&!producer.pending){
+        for(const [,edge]of this.visibleBindings(producer))if(!ids.has(edge.target)){ids.add(edge.target);pending.push(edge.target);}
+      }
+      let spec = this.storage.gatekeepers.get(id)?.creationSpec;
       if (spec?.type !== "agentSpawner") continue;
       for (let target of Object.values(spec.config.env)) {
         if (ids.has(target) || !this.storage.gatekeepers.get(target)) continue;
@@ -9926,6 +10475,24 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     await this.impl.runAlarmTasks();
   }
 
+  /** Read the deadline sealed into a gatekeeper's kernel alarm capability. */
+  getGatekeeperContinuationAlarm(id: number): number | null { return this.impl.gatekeeperAlarm(id); }
+
+  /** Update only the deadline sealed into a gatekeeper's kernel alarm capability. */
+  setGatekeeperContinuationAlarm(id: number, timestamp: number | null): void {
+    this.impl.setGatekeeperAlarm(id, timestamp);
+  }
+
+  /** Read only the gadget deadline sealed into its lifecycle capability. */
+  getGadgetContinuationAlarm(id: number, accessRevision: number): number | null {
+    return this.impl.gadgetAlarm(id, accessRevision);
+  }
+
+  /** Update only the gadget deadline sealed into its lifecycle capability. */
+  setGadgetContinuationAlarm(id: number, accessRevision: number, timestamp: number | null, chatId?: number): void {
+    this.impl.setGadgetAlarm(id, accessRevision, timestamp, chatId);
+  }
+
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote
   // an empty Yjs snapshot as legacy code version 1; workspaces born since have no legacy code
   // log at all -- committed code exists only once a first commit lands in the git store.)
@@ -10524,6 +11091,8 @@ type GatekeeperLoopbackProps = {
 };
 
 type BindingLoopbackTarget = {
+  type:'gadgetCapability';gadgetId:WorkpieceId;name:string;generation:string;epoch:string;
+} | {
   type: "gadget" | "gatekeeper";
   id: WorkpieceId;
 } | {
@@ -10540,6 +11109,16 @@ type BindingLoopbackTarget = {
   type: "git";
 };
 
+class GadgetRevisionObserver extends NativeRpcTarget implements GadgetProjectionNotification {
+  constructor(private deliver:(revision:string)=>Promise<void>){super();}
+  changed(revision:string):Promise<void>{return this.deliver(revision);}
+}
+
+class GadgetConnectionLease extends NativeRpcTarget {
+  constructor(private cancel:()=>void){super();}
+  [Symbol.dispose]():void{this.cancel();}
+}
+
 /**
  * Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
  * contain RpcStubs. But if we ask the gatekeeper to open a session, we get an RpcStub. So we
@@ -10550,6 +11129,60 @@ type BindingLoopbackTarget = {
  * TODO(multi-gadget): Rename to BindingLoopback. Stubs to this entrypoint aren't stored anywhere,
  * so a rename should be safe.
  */
+/** Fixed read-only binding surface; no dynamic proxy can expose producer methods. */
+export class GadgetProjectionLoopback extends WorkerEntrypoint<
+  Cloudflare.Env,
+  GatekeeperLoopbackProps
+> {
+  #session() {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    return ns
+      .get(ns.idFromString(this.ctx.props.overseerId))
+      .startGatekeeperSession(this.ctx.props.target, this.ctx.props.caller);
+  }
+  /** Obtain kernel-derived producer identity, revalidated against the live edge. */
+  async identity() {
+    using session = await this.#session();
+    return await session.identity();
+  }
+  /** Read only the named projection selected by the sealed binding props. */
+  async project(request: unknown): Promise<unknown> {
+    using session = await this.#session();
+    return await session.project(request);
+  }
+  /** Subscribe only to revision notifications; the kernel guards every delivery. */
+  async subscribe(
+    request: unknown,
+    observer: NativeRpcStub<GadgetProjectionConsumerObserver>,
+  ): Promise<NativeRpcStub<NativeRpcTarget>> {
+    using session = await this.#session();
+    return await session.subscribe(request, observer);
+  }
+}
+
+/** Fixed write-only binding surface, separate from projection authority. */
+export class GadgetCommandLoopback extends WorkerEntrypoint<
+  Cloudflare.Env,
+  GatekeeperLoopbackProps
+> {
+  /** Obtain kernel-derived producer identity, revalidated against the live edge. */
+  async identity() {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    using session = await ns
+      .get(ns.idFromString(this.ctx.props.overseerId))
+      .startGatekeeperSession(this.ctx.props.target, this.ctx.props.caller);
+    return await session.identity();
+  }
+  /** Execute only the named command selected by the sealed binding props. */
+  async execute(request: unknown): Promise<unknown> {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    using session = await ns
+      .get(ns.idFromString(this.ctx.props.overseerId))
+      .startGatekeeperSession(this.ctx.props.target, this.ctx.props.caller);
+    return await session.execute(request);
+  }
+}
+
 export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, GatekeeperLoopbackProps> {
   constructor(ctx: ExecutionContext<GatekeeperLoopbackProps>, env: Cloudflare.Env) {
     super(ctx, env);
@@ -10579,6 +11212,47 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
    * and so the loopback binding won't be created.
    */
   dummyMethodToWorkAroundValidatorBug() {}
+}
+
+/** Persistent, single-facet alarm capability; it cannot dispatch arbitrary methods. */
+export class GatekeeperAlarmLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, {overseerId: string; gatekeeperId: number}>
+    implements GatekeeperAlarmScheduler {
+  #overseer() {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    return ns.get(ns.idFromString(this.ctx.props.overseerId));
+  }
+  getAlarm(): Promise<number | null> {
+    return this.#overseer().getGatekeeperContinuationAlarm(this.ctx.props.gatekeeperId);
+  }
+  setAlarm(timestamp: number): Promise<void> {
+    return this.#overseer().setGatekeeperContinuationAlarm(this.ctx.props.gatekeeperId, timestamp);
+  }
+  deleteAlarm(): Promise<void> {
+    return this.#overseer().setGatekeeperContinuationAlarm(this.ctx.props.gatekeeperId, null);
+  }
+}
+
+/** Kernel lifecycle capability sealed to one gadget and access revision. */
+export class GadgetAlarmLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, {overseerId: string; gadgetId: number; accessRevision: number; chatId?: number}>
+    implements GadgetAlarmScheduler {
+  #overseer() {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    return ns.get(ns.idFromString(this.ctx.props.overseerId));
+  }
+  /** Read this gadget's requested deadline. */
+  async getAlarm(): Promise<number | null> {
+    return await this.#overseer().getGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision);
+  }
+  /** Schedule this permanent gadget's accepted-code alarm. */
+  async setAlarm(timestamp: number): Promise<void> {
+    return await this.#overseer().setGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision, timestamp, this.ctx.props.chatId);
+  }
+  /** Cancel only this gadget's wakeup. */
+  async deleteAlarm(): Promise<void> {
+    return await this.#overseer().setGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision, null, this.ctx.props.chatId);
+  }
 }
 
 type GatekeeperHookLoopbackProps = {
@@ -11189,8 +11863,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     });
   }
 
-  async newGatekeeper(accountId: number, resourceUrl: string)
+  async newGatekeeper(accountId: number, resourceUrl?: string)
       : Promise<GatekeeperClient<any> | null> {
+    if(resourceUrl===undefined){
+      if(this.clientUserId!==this.impl.ownerId)throw Error('Only the workspace owner can add an ambient account connection.');
+      const {class:cls,vendorId}=await this.#clientUser.getAmbientSingletonGatekeeperClass(accountId);
+      const existing=[...this.impl.storage.gatekeepers.list()].find(record=>record.creationSpec?.type==='ambient'&&record.creationSpec.accountId===accountId&&record.creationSpec.vendorId===vendorId);
+      if(existing)return this.getGatekeeperById(existing.id);
+      return this.impl.addGatekeeper(cls,{type:'ambient',vendorId,accountId},this.clientUserId,this.#mintedCapabilityKind());
+    }
     let {class: cls, vendorId, typeUrlPattern} =
         await this.#clientUser.getGatekeeperClassFor(accountId, resourceUrl);
     let creationSpec: GatekeeperCreationSpec = {
@@ -11802,22 +12483,65 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // Compaction boundaries delimit the pages: the newest page is the tail replay still scans, and each
   // earlier page is the span one checkpoint summarized. A thread that was never compacted has a
   // single page.
-  async getChatHistory(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage> {
+  async getChatHistory(chatId: number, beforeSequence?: number,
+      transport?: {boundary?: number | null}): Promise<AiChatHistoryPage> {
     let checkpoint = beforeSequence === undefined
         ? this.impl.getActiveChatCompaction(chatId)
         : this.impl.getChatCompactionBelow(chatId, beforeSequence);
-    let result = [...this.impl.storage.chats.list({
+    if (transport?.boundary !== undefined) {
+      const boundary = transport.boundary;
+      if (boundary !== null && (!Number.isSafeInteger(boundary) || boundary < 0 ||
+          beforeSequence !== undefined && boundary > beforeSequence)) {
+        throw Error('Invalid chat history checkpoint.');
+      }
+      checkpoint = boundary === null ? undefined : this.impl.getChatCompactionBelow(chatId, boundary + 1);
+      if (boundary !== null && checkpoint?.compactedTo !== boundary) {
+        throw Error('The chat history checkpoint changed. Reload the conversation.');
+      }
+    }
+    const compacted = checkpoint && {
+      to: checkpoint.compactedTo,
+      summary: checkpoint.summary,
+      proposedChange: checkpoint.proposedChange,
+    };
+    const metadataBytes = chatHistoryBytes(compacted);
+    if (metadataBytes + 4096 > CHAT_HISTORY_ITEM_BYTES) {
+      throw Error('The chat checkpoint exceeds the bounded history transport size. Its stored history is unchanged.');
+    }
+    const messages: AiChatMessage[] = [];
+    let bytes = 4096;
+    let nextBefore: number | undefined;
+    for (const raw of this.impl.storage.chats.list({
       prefix: `${keyString(chatId)}.`,
       start: checkpoint && compactionKey(chatId, checkpoint.compactedTo),
       end: beforeSequence === undefined ? undefined : compactionKey(chatId, beforeSequence),
-    })];
+      reverse: true,
+    })) {
+      const message = this.#getChatMessageForClient(raw);
+      const size = chatHistoryBytes(message);
+      if (size + 4096 > CHAT_HISTORY_ITEM_BYTES) {
+        throw Error('One chat message exceeds the bounded history transport size. Its stored history is unchanged.');
+      }
+      if (messages.length && (bytes + size > CHAT_HISTORY_PAGE_BYTES || messages.length >= 128)) {
+        nextBefore = messages.at(-1)!.sequence;
+        break;
+      }
+      messages.push(message);
+      bytes += size;
+    }
+    // A large checkpoint can travel in its own terminal fragment. The real
+    // boundary stays fixed; no synthetic compaction or pending-change summary.
+    if (nextBefore === undefined && messages.length && bytes + metadataBytes > CHAT_HISTORY_PAGE_BYTES) {
+      nextBefore = messages.at(-1)!.sequence;
+    }
+    if (nextBefore !== undefined && transport === undefined) {
+      throw Error('This conversation requires bounded history paging. Reload the updated Workshop to open it.');
+    }
     return {
-      messages: result.map((msg) => this.#getChatMessageForClient(msg)),
-      compacted: checkpoint && {
-        to: checkpoint.compactedTo,
-        summary: checkpoint.summary,
-        proposedChange: checkpoint.proposedChange,
-      },
+      messages: messages.toReversed(),
+      ...(nextBefore === undefined ? {compacted} : {
+        continuation: {beforeSequence: nextBefore, boundary: checkpoint?.compactedTo ?? null},
+      }),
     };
   }
 
@@ -12537,7 +13261,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async listPreApprovableActions(): Promise<PreApprovableAction[]> { this.#deny(); }
   async getGatekeeperById(_id: number): Promise<GatekeeperClient<any>> { this.#deny(); }
-  async newGatekeeper(_accountId: number, _resourceUrl: string)
+  async newGatekeeper(_accountId: number, _resourceUrl?: string)
       : Promise<GatekeeperClient<any> | null> { this.#deny(); }
   async newAiModelGatekeeper(_modelId: string): Promise<GatekeeperClient<any>> { this.#deny(); }
   async newAgentSpawnerGatekeeper(_config: AgentSpawnerConfig): Promise<GatekeeperClient<any>> {
@@ -12579,7 +13303,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async listChats(): Promise<AiChatMetadata[]> { this.#deny(); }
   async listModels(): Promise<AiChatAuthorInfo[]> { this.#deny(); }
-  async getChatHistory(_chatId: number, _beforeSequence?: number): Promise<AiChatHistoryPage> {
+  async getChatHistory(_chatId: number, _beforeSequence?: number,
+      _transport?: {boundary?: number | null}): Promise<AiChatHistoryPage> {
     this.#deny();
   }
   async getChatMessage(_chatId: number, _sequence: number): Promise<AiChatMessage | undefined> { this.#deny(); }
@@ -12686,6 +13411,19 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace';
   }
 
+  async getCapabilityExports():Promise<GadgetCapabilityExports>{return this.impl.getCapabilityExports(this.id);}
+
+  async executeCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    return this.impl.executeGadgetCapability(this.id, spec, request, this.clientUserId);
+  }
+
+  async bindCapability(name:string,target:WorkpieceId,spec:GadgetCapabilitySpec,chatId?:number):Promise<void>{
+    if(chatId!==undefined&&!this.impl.storage.chatMeta.get(chatId))throw Error(`No such chat: ${chatId}`);
+    const author=chatId===undefined?undefined:await retryOnDoReset(()=>this.#clientUser.whoami(),this.impl.logger);
+    await this.impl.bindGadgetCapability(this.id,name,target,spec,this.clientUserId,chatId);
+    if(chatId!==undefined)this.impl.addChatMessages(chatId,author!,[{type:'changes',addedBindings:[{gadgetId:this.id,name,target}]}]);
+  }
+
   async setAccess(configuration: GadgetAccessConfiguration): Promise<void> {
     if (this.clientUserId !== this.impl.ownerId) throw new Error("Only the workspace owner can set gadget access.");
     const accessKeyHash = await gadgetAccessHash(configuration);
@@ -12701,6 +13439,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     record.accessKeyHash = accessKeyHash;
     record.accessRevision = (record.accessRevision ?? 0) + 1;
     this.impl.storage.gadgets.put(record);
+    this.impl.revokeGadgetConnections(this.id);
     this.impl.bumpVersion([this.id]);
   }
 
@@ -12754,7 +13493,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       return {
         name,
         target: edge.target,
-        resourceTitle: gatekeeper?.resourceTitle || "(title unavailable)",
+        resourceTitle: gatekeeper?.resourceTitle || unlockedGadgetTitle(this.impl.storage.gadgets.get(edge.target)) || "(title unavailable)",
+        ...(edge.capability?{capability:{port:edge.capability.port,kind:edge.capability.kind,protocol:edge.capability.protocol}}:{}),
         vendorId: gatekeeper?.creationSpec?.type === "gatekeeper"
             ? gatekeeper.creationSpec.vendorId
             : undefined,
@@ -12981,6 +13721,9 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async getAccessMode(): Promise<'workspace' | 'key'> { this.#authorize(); return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace'; }
   async setAccess(_configuration: GadgetAccessConfiguration): Promise<void> { this.#deny(); }
+  async getCapabilityExports():Promise<GadgetCapabilityExports>{this.#deny();}
+  async bindCapability(_name:string,_target:WorkpieceId,_spec:GadgetCapabilitySpec,_chatId?:number):Promise<void>{this.#deny();}
+  async executeCapability(_spec: GadgetCapabilitySpec, _request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> { this.#deny(); }
 
   // --- Allowed methods ---
 
@@ -13018,16 +13761,20 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
     if (chatId !== undefined) this.#deny();
-    this.#authorize(); const result = await this.impl.getGadgetExportFormats(this.id); this.#authorize(); return result;
+    this.#authorize(); this.impl.assertGadgetUseWithoutCommands(this.id);
+    const result = await this.impl.getGadgetExportFormats(this.id);
+    this.#authorize(); this.impl.assertGadgetUseWithoutCommands(this.id); return result;
   }
 
   async export(id: string, chatId?: number): Promise<ReadableStream<Uint8Array>> {
     if (chatId !== undefined) this.#deny();
     this.#authorize();
+    this.impl.assertGadgetUseWithoutCommands(this.id);
     const revision = this.impl.getGadgetRecord(this.id).accessRevision ?? 0;
     const result = await this.impl.exportGadget(this.id, id);
     const authorize = () => {
       this.#authorize();
+      this.impl.assertGadgetUseWithoutCommands(this.id);
       if ((this.impl.getGadgetRecord(this.id).accessRevision ?? 0) !== revision) throw new Error('This gadget export has been revoked.');
     };
     try { authorize(); } catch (error) { await result.cancel(error).catch(() => {}); throw error; }

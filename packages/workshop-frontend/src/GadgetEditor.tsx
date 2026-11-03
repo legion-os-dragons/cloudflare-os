@@ -1449,6 +1449,7 @@ export default function GadgetEditor() {
         metadata={metadata}
         authenticatedApi={authenticatedApi}
         currentUserId={userInfo?.id ?? null}
+        onRetryConnection={retryOpen}
       />
     )
   }
@@ -1957,6 +1958,7 @@ export default function GadgetEditor() {
                 <GadgetUI
                   key={selectedGadgetId}
                   gadget={selectedGadgetStub}
+                  onRetryConnection={retryOpen}
                   deviceStateScope={userInfo && selectedGadgetId != null ? {userId: userInfo.id, workspaceId: metadata.id, gadgetId: selectedGadgetId} : undefined}
                   height="100%"
                   reloadTrigger={uiReloadTrigger}
@@ -2002,6 +2004,7 @@ export default function GadgetEditor() {
                   isVisible={activeTab === 'code'}
                   onHasCodeChange={setHasCode}
                   onReviewChat={navigateToChat}
+                  onRetryConnection={retryOpen}
                 />
               ) : (
                 <NoGadgetPlaceholder height="100%" />
@@ -2056,6 +2059,7 @@ export default function GadgetEditor() {
             <GadgetUI
               key={selectedGadgetId}
               gadget={selectedGadgetStub}
+              onRetryConnection={retryOpen}
                   deviceStateScope={userInfo && selectedGadgetId != null ? {userId: userInfo.id, workspaceId: metadata.id, gadgetId: selectedGadgetId} : undefined}
               height="100%"
               reloadTrigger={uiReloadTrigger}

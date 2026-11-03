@@ -52,6 +52,8 @@ export function uniqueBindingBadges(
     } else if (b.type === "aiModel") {
       key = "aiModel";
       label = "AI Model";
+    } else if(b.type==='gadgetCapability'){
+      key='gadgetCapability';label='Gadget connection';
     } else {
       key = "agentSpawner";
       label = "Agent";

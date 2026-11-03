@@ -4,7 +4,7 @@ const CHANNEL = 'gadgets.connected-accounts.changed'
 const STORAGE_KEY = 'gadgets.connected-accounts.changed'
 export function notifyConnectedAccountsChanged(): void {
   const signal = { kind: CHANNEL, id: crypto.randomUUID() }
-  try { const channel = new BroadcastChannel(CHANNEL); channel.postMessage(signal); channel.close() } catch { /* Browser storage fallback below. */ }
+  try { const channel = new BroadcastChannel(CHANNEL); const broadcast = channel.postMessage.bind(channel); broadcast(signal); channel.close() } catch { /* Browser storage fallback below. */ }
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(signal)); localStorage.removeItem(STORAGE_KEY) } catch { /* Returning focus also refreshes the owning tab. */ }
 }
 export function onConnectedAccountsChanged(refresh: () => void): () => void {
@@ -17,7 +17,7 @@ export function onConnectedAccountsChanged(refresh: () => void): () => void {
     seen.add(signal.id); refresh()
   }
   let channel: BroadcastChannel | undefined
-  try { channel = new BroadcastChannel(CHANNEL); channel.onmessage = event => receive(event.data) } catch { /* Use the same-origin storage event and focus fallback. */ }
+  try { channel = new BroadcastChannel(CHANNEL); channel.addEventListener('message', event => receive(event.data)) } catch { /* Use the same-origin storage event and focus fallback. */ }
   const storage = (event: StorageEvent) => {
     if (event.key !== STORAGE_KEY || !event.newValue || event.newValue.length > 160) return
     try { receive(JSON.parse(event.newValue)) } catch { /* Ignore malformed notifications. */ }

@@ -12,8 +12,9 @@ async function bounded(stream:ReadableStream<Uint8Array>,limit:number){
 /** Decode an editor-selected candidate without mutating the instance or its library. */
 export async function previewGadgetCodeUpgrade(env:Pick<Cloudflare.Env,'BLUEPRINTS'|'BLUEPRINT_CONTENT'>,id:WorkpieceId,baseCommit:string,source:GadgetUpgradeSource):Promise<GadgetUpgradePreview>{
  let title:string,version:number,bindings:Record<string,unknown>,snapshot:Uint8Array;
- if(source.type==='archive'){
-  const raw=await bounded(source.archive,32*1024*1024+65536+24);
+ if(source.type==='archive'||source.type==='archive-upload'){
+  const stream=source.type==='archive-upload'?await source.archive.read():source.archive;
+  const raw=await bounded(stream,32*1024*1024+65536+24);
   const parsed=await parseBlueprintArchive(new Response(raw).body!);
   const compressed=await bounded(parsed.content,32*1024*1024);
   if(compressed.length!==parsed.contentLength)throw Error('Gadget upgrade archive length does not match its header.');
@@ -38,6 +39,6 @@ export async function previewGadgetCodeUpgrade(env:Pick<Cloudflare.Env,'BLUEPRIN
   const change:CodeChange={[id]:files.map(([path,text])=>[path,{set:text}])};
   validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());
   const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',snapshot));
-  return{title,version,baseCommit,contentSha256:Array.from(digest,byte=>byte.toString(16).padStart(2,'0')).join(''),files,requiredBindings:Object.keys(bindings).sort()};
+  return{title,version,baseCommit,contentSha256:Array.from(digest,byte=>byte.toString(16).padStart(2,'0')).join(''),files,requiredBindings:Object.keys(bindings).toSorted()};
  }finally{doc.destroy();}
 }

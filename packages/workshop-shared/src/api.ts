@@ -27,6 +27,7 @@ import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorAdminActionResult, VendorAdminView, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
+import { GADGET_CAPABILITY_BRIDGE_TOKEN } from "./gadget-capabilities.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -237,6 +238,8 @@ const RESERVED_WORDS = new Set([
  * generated names), not enforced here.
  */
 export function validateBindingName(name: string): void {
+  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN)
+    throw Error("This binding name is reserved for the native gadget command bridge.");
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
         `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
@@ -2110,7 +2113,7 @@ export interface Overseer extends RpcTarget {
    * The new gatekeeper is a workspace-level workpiece; it is not bound into any gadget's `env` by
    * default. Use GadgetClient.bind() / bindWithSuggestedName() to expose it to a gadget.
    */
-  newGatekeeper(accountId: number, resourceUrl: string): Promise<GatekeeperClient<any> | null>;
+  newGatekeeper(accountId: number, resourceUrl?: string): Promise<GatekeeperClient<any> | null>;
 
   /**
    * Create a new gatekeeper for an AI model binding. The model can be any returned by
@@ -2253,7 +2256,8 @@ export interface Overseer extends RpcTarget {
    * In typical usage, the client subscribes to all chat activity upfront, but only fetches
    * histories if and when the user opens a specific.
    */
-  getChatHistory(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage>;
+  getChatHistory(chatId: number, beforeSequence?: number,
+      transport?: {boundary?: number | null}): Promise<AiChatHistoryPage>;
 
   /** Fetch a single message from a chat thread. */
   getChatMessage(chatId: number, sequence: number): Promise<AiChatMessage | undefined>;
@@ -2789,9 +2793,16 @@ export type ChatGadgetPinState = ChatGadgetPin & {
  * One client code-change submission (see Overseer.submitCodeChange() for the full validation and
  * retry contract).
  */
+/** One editor-selected archive, exposed as a bounded streaming source. */
+export interface GadgetArchiveUpload extends RpcTarget {
+  /** Return the original archive stream once; a second read must be refused. */
+  read(): ReadableStream<Uint8Array>;
+}
+
 /** A reviewed code candidate from an actual archive or the current revision of a library blueprint. */
 export type GadgetUpgradeSource =
     { /** Decode this bounded .gadget archive without importing it into the library. */ type: "archive"; /** Original archive bytes. */ archive: ReadableStream<Uint8Array> }
+  | { /** Read an editor-selected archive through a streaming RPC target. */ type: "archive-upload"; /** One-shot target returning the original archive stream. */ archive: RpcStub<GadgetArchiveUpload> }
   | { /** Read the library's current published revision. */ type: "blueprint"; /** Existing blueprint bearer ID. */ blueprintId: string };
 
 /** Validated code candidate. No gadget identity, storage, access policy or bindings are replaced. */
@@ -2873,6 +2884,10 @@ export type MergeChangesResult = {
 export type AiChatHistoryPage = {
   /** The page's messages, ascending by sequence. */
   messages: AiChatMessage[];
+
+  /** Transport continuation within this same logical checkpoint page. Assemble
+   * all fragments before computing pending changes. This is not compaction. */
+  continuation?: {beforeSequence: number; boundary: number | null};
 
   /** The checkpoint bounding this page below, absent once the page reaches the thread's start. */
   compacted?: {
@@ -3479,6 +3494,11 @@ export type AiToolCall = {
    * persisted before descriptions were recorded, whose replay elides the result.
    */
   output?: string;
+} | {
+  /** Execute a declared command under the authenticated agent initiator; replay returns recorded output. */
+  toolName: "executeGadgetCommand";
+  input: { gadget: string; port: string; protocol: string; request: import('./gadget-capabilities').GadgetCapabilityJson };
+  output?: import('./gadget-capabilities').GadgetCapabilityJson;
 } | {
   toolName: "setBindingHook";
   input: {
@@ -4127,6 +4147,8 @@ export interface WorkpiecesSubscriber {
  * GadgetClient.listBindings().
  */
 export type GadgetBindingInfo = {
+  /** Present for a named, attenuated gadget capability rather than a gatekeeper. */
+  capability?: import('./gadget-capabilities').GadgetCapabilitySpec;
   /** The binding name, as it appears in the gadget worker's `env`. */
   name: string;
 
@@ -4283,6 +4305,13 @@ export type BlueprintBinding = {
    * it up to the recipient.
    */
   suggestedModel?: {provider: string, modelName: string};
+} | {
+  /** A named capability from another gadget in the same workspace. */
+  type:'gadgetCapability';
+  /** Exact read/write authority and domain protocol required by the consumer. */
+  capability:import('./gadget-capabilities').GadgetCapabilitySpec;
+  /** Standalone gadgets may run without this connection. */
+  optional?:true;
 } | {
   /** An agent spawner binding. */
   type: "agentSpawner";
@@ -4479,6 +4508,19 @@ export type GadgetAccessConfiguration =
  * sharing, actions, blueprint listing) stay on Overseer; this covers the per-gadget surface.
  */
 export interface GadgetClient extends WorkpieceClient {
+  /** List the producer's explicitly exported projection/command ports. */
+  getCapabilityExports():Promise<import('./gadget-capabilities').GadgetCapabilityExports>;
+
+  /** Build-only canonical command on this gadget; actor identity comes from the authenticated session. */
+  executeCapability(spec: import('./gadget-capabilities').GadgetCapabilitySpec,
+    request: import('./gadget-capabilities').GadgetCapabilityJson): Promise<import('./gadget-capabilities').GadgetCapabilityJson>;
+
+  /**
+   * Grant a named same-workspace gadget port; raw gadget capabilities cannot be bound.
+   * Gadgets reaching a command port require build access for interactive roots and exports.
+   * Keep a separate projection-only gadget when sharing a UI with use-role collaborators.
+   */
+  bindCapability(name:string,target:WorkpieceId,spec:import('./gadget-capabilities').GadgetCapabilitySpec,chatId?:number):Promise<void>;
   /** Current OS admission mode; this never returns the key or its digest. */
   getAccessMode(): Promise<'workspace' | 'key'>;
 

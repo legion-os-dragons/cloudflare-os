@@ -21,6 +21,7 @@ const WORKERD_DEAD_CAPABILITY_MESSAGE =
 const DO_RESET_MESSAGES = [
   'Durable Object reset because its code was updated',
   'Durable Object storage operation exceeded timeout',
+  'Internal error in Durable Object storage caused object to be reset',
   "Durable Object's isolate exceeded its memory limit",
   'Durable Object exceeded its CPU time limit',
   WORKERD_DEAD_CAPABILITY_MESSAGE,
@@ -38,6 +39,12 @@ export const CONNECTION_MESSAGES = [
   // What RPCs on an already-disposed stub reject with — e.g. the zombie the connection manager
   // disposes while an outage is being recovered.
   'Attempted to use RPC stub after it has been disposed',
+]
+
+// Native Worker RPC can lose its connection while the Cap'n Web socket remains healthy.
+const WORKER_CONNECTION_MESSAGES = [
+  'Network connection lost',
+  'Connection closed: this Durable Object instance is no longer active. Reconnect or retry the request.',
 ]
 
 // Fallback for auth errors thrown without a code (older deployments); codes are authoritative.
@@ -67,7 +74,7 @@ export function classifyRpcError(err: unknown): RpcErrorClass {
   // observe it. It classifies with do-reset, whose callers own that recovery.
   if (isDurableObjectResetError(err) || flag(err, 'retryable')) return 'do-reset'
   const message = messageOf(err)
-  if (CONNECTION_MESSAGES.some(m => message.includes(m))) {
+  if ([...CONNECTION_MESSAGES, ...WORKER_CONNECTION_MESSAGES].some(m => message.includes(m))) {
     return 'connection'
   }
   // 'auth' is deliberately terminal — never quieted, never retried, and there is no missing

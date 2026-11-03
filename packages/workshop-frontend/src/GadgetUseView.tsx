@@ -42,6 +42,7 @@ type Props = {
   metadata: GadgetMetadata
   authenticatedApi: RpcStub<AuthenticatedApi>
   currentUserId: string | null
+  onRetryConnection?: () => void
 }
 
 // Matches the top bar height used by the full editor (and the home page header).
@@ -56,6 +57,7 @@ export default function GadgetUseView({
   metadata,
   authenticatedApi,
   currentUserId,
+  onRetryConnection,
 }: Props) {
   const [unlocked, setUnlocked] = useState<UnlockedGadget | null>(null)
   useEffect(() => () => { unlocked?.stub[Symbol.dispose]() }, [unlocked])
@@ -162,6 +164,7 @@ export default function GadgetUseView({
             deviceStateScope={currentUserId && activeId !== null ? {userId: currentUserId, workspaceId: metadata.id, gadgetId: activeId} : undefined}
             height="100%"
             isVisible={true}
+            onRetryConnection={onRetryConnection}
           />
         ) : (
           <div className="flex h-full items-center justify-center px-6 text-center">

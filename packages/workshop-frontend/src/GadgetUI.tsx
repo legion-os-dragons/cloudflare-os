@@ -1,12 +1,13 @@
 import {GadgetConnectionsSession} from './features/gadgets/connectionsSession'
 import { useState, useEffect, useRef } from 'react'
-import { Text, Loader, Banner } from '@cloudflare/kumo'
+import { Text, Loader, Banner, Button } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
 import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
 import { GadgetDeviceState, type DeviceStateScope } from './features/gadgets/deviceState'
 import { GadgetFileActions } from './features/gadgets/fileActions'
 import { GadgetAccessSession } from './features/gadgets/accessSession'
+import { isTransientRpcError } from './rpcErrors'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -128,6 +129,8 @@ interface GadgetUIProps {
   chatId?: number
   onConsoleLog?: (log: ConsoleLogEvent) => void
   onOpenConnections?: () => void
+  // Reopen through the authenticated workspace owner when a retained client has expired.
+  onRetryConnection?: () => void
   // Fires when the user presses Escape while the gadget iframe has focus. Sandboxed iframes
   // capture keydown events, so we forward Escape explicitly from inside the iframe.
   onIframeEscape?: () => void
@@ -140,12 +143,16 @@ interface GadgetUIProps {
 // budget: the point at which we conclude the reply is never coming.
 const UI_BUNDLE_LOAD_TIMEOUT_MS = 20_000
 const RECONNECT_TIMEOUT_MS = 5_000
+const READ_RECONNECT_TIMEOUT_MS = 10_000
+// Only metadata reads: financial updates, submissions and approvals must never be replayed.
+// UI chunks are immutable, digest-checked code reads; retrying them cannot replay a CRM write.
+const RECOVERABLE_STATUS_READS = new Set(['documentCatalog', 'documentIntakeStatus', 'documentRefreshStatus', 'feedCursors', 'uiAssetChunk'])
 
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={`${props.chatId}:${props.deviceStateScope?.userId ?? ""}:${props.deviceStateScope?.workspaceId ?? ""}:${props.deviceStateScope?.gadgetId ?? ""}`} {...props} />
 }
 
-function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections }: GadgetUIProps) {
+function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections, onRetryConnection }: GadgetUIProps) {
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -158,10 +165,17 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   const loadGenerationRef = useRef(0)
   // Bumped by the retry button to ask for a fresh load.
   const [retryNonce, setRetryNonce] = useState(0)
+  const retryConnectionFromRef = useRef<RpcStub<GadgetClient> | null>(null)
   const connectionGenerationRef = useRef(0)
+  // A server-facet replacement keeps the current iframe and its scoped parent
+  // capabilities alive. Do not confuse a reconnect attempt with iframe expiry.
+  const reconnectGenerationRef = useRef(0)
   const handshakePendingRef = useRef<number | null>(null)
+  const handshakeRecoveryAttemptsRef = useRef(0)
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
+  const onRetryConnectionRef = useRef(onRetryConnection)
+  onRetryConnectionRef.current = onRetryConnection
   // TODO: Remove `any` when Cap'n Web fixes cyclic type issues (RpcStub<any> triggers deep instantiation)
   const gadgetStubRef = useRef<any>(null)
   const pendingGadgetStubRef = useRef<{
@@ -170,6 +184,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
     reject: (reason: unknown) => void
   } | null>(null)
   const rpcSessionRef = useRef<any>(null)
+  const readRecoveryRef = useRef<Promise<any> | null>(null)
   // Keep latest callbacks in refs so the message-handler effect never tears down the RPC session.
   const onOpenConnectionsRef = useRef(onOpenConnections)
   onOpenConnectionsRef.current = onOpenConnections
@@ -204,17 +219,25 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   }
 
   const installGadgetStub = (stub: any) => {
+    const generation = connectionGenerationRef.current
     gadgetStubRef.current = stub
-    stub.onRpcBroken?.(() => {
-      if (gadgetStubRef.current === stub) suspendGadgetCalls()
+    stub.onRpcBroken?.((caught: unknown) => {
+      if (generation !== connectionGenerationRef.current ||
+          gadgetStubRef.current !== stub || pendingGadgetStubRef.current) return
+      suspendGadgetCalls()
+      // An inner WorkerLoader facet can break while the owner's WebSocket stays
+      // healthy. Reopen the authorized owner; never replay the failed call.
+      if (isTransientRpcError(caught)) onRetryConnectionRef.current?.()
     })
   }
 
   const resetConnection = (reason: unknown) => {
     ++connectionGenerationRef.current
+    ++reconnectGenerationRef.current
     handshakePendingRef.current = null
     pendingGadgetStubRef.current?.reject(reason)
     pendingGadgetStubRef.current = null
+    readRecoveryRef.current = null
     gadgetStubRef.current?.[Symbol.dispose]?.()
     gadgetStubRef.current = null
     rpcSessionRef.current?.[Symbol.dispose]?.()
@@ -234,8 +257,10 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
       return
     }
 
-    const generation = ++connectionGenerationRef.current
-    const isCurrent = () => generation === connectionGenerationRef.current
+    const generation = connectionGenerationRef.current
+    const reconnectGeneration = ++reconnectGenerationRef.current
+    const isCurrent = () => generation === connectionGenerationRef.current &&
+      reconnectGeneration === reconnectGenerationRef.current
     const pendingStub = suspendGadgetCalls()
     const replacementPromise = Promise.resolve().then(() => gadget.connectToGadget(chatId))
     void replacementPromise.then(stub => {
@@ -285,11 +310,20 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
 
   // Effect to load UI bundle when component becomes visible for the first time or when invalidated
   useEffect(() => {
+    const retryFrom = retryConnectionFromRef.current
+    // A loaded bundle can still fail its server handshake. A fresh owner connection must
+    // reload that view too, but a manual retry must never issue another call on the old stub.
+    if (retryFrom === gadget) return
+    const retryConnection = retryFrom !== null
     // Only load if:
     // 1. Component is visible AND
     // 2. Either never loaded before OR invalidated due to code changes
-    if (!isVisible || (hasLoaded && !isInvalidated)) {
+    if (!isVisible || (!retryConnection && hasLoaded && !isInvalidated)) {
       return
+    }
+    if (retryConnection) {
+      retryConnectionFromRef.current = null
+      resetConnection(new Error('Gadget UI connection was retried.'))
     }
 
     // Superseded loads are ignored by generation rather than by a per-run `cancelled` flag: a run
@@ -383,12 +417,57 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             setItem: (key, value) => window.localStorage.setItem(key, value),
           }, isCurrent)
           const fileActions = new GadgetFileActions(deviceStateScope, isCurrent)
-          const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent)
+          const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
+            if (isCurrent()) onRetryConnectionRef.current?.()
+          })
           const connectionsSession = new GadgetConnectionsSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
             if(!isCurrent() || !onOpenConnectionsRef.current)return false
             onOpenConnectionsRef.current()
             return true
           })
+          const recoverStatusRead = (failedStub: any): Promise<any> => {
+            if (!isCurrent()) return Promise.reject(new Error('Gadget session has ended.'))
+            if (!pendingGadgetStubRef.current && gadgetStubRef.current !== failedStub) {
+              return Promise.resolve(gadgetStubRef.current)
+            }
+            if (readRecoveryRef.current) return readRecoveryRef.current
+            const alreadyReconnecting = pendingGadgetStubRef.current !== null
+            if (!alreadyReconnecting && !onRetryConnectionRef.current) return Promise.reject(new Error('Gadget connection recovery is unavailable.'))
+            const pending = suspendGadgetCalls()
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const recovery = Promise.race([
+              pending.promise,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                  const recoveryError = new Error('Timed out reopening gadget status reads.')
+                  if (isCurrent() && pendingGadgetStubRef.current === pending) {
+                    pendingGadgetStubRef.current = null
+                    pending.reject(recoveryError)
+                  }
+                  reject(recoveryError)
+                }, READ_RECONNECT_TIMEOUT_MS)
+              }),
+            ]).finally(() => {
+              if (timer !== undefined) clearTimeout(timer)
+              if (readRecoveryRef.current === recovery) readRecoveryRef.current = null
+            })
+            readRecoveryRef.current = recovery
+            if (!alreadyReconnecting) onRetryConnectionRef.current?.()
+            return recovery
+          }
+          const callStatusRead = async (property: string, args: any[]) => {
+            const stub = pendingGadgetStubRef.current
+              ? await recoverStatusRead(gadgetStubRef.current) : gadgetStubRef.current
+            if (!isCurrent()) throw new Error('Gadget session has ended.')
+            try {
+              return await stub[property](...args)
+            } catch (caught) {
+              if (!isCurrent() || !isTransientRpcError(caught)) throw caught
+              const replacement = await recoverStatusRead(stub)
+              if (!isCurrent()) throw new Error('Gadget session has ended.', { cause: caught })
+              return replacement[property](...args)
+            }
+          }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
               if (property === 'workshopDeviceState') return deviceState
@@ -398,6 +477,9 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               if (typeof property === 'symbol' || property in target) {
                 return Reflect.get(target, property, receiver)
               }
+              if (RECOVERABLE_STATUS_READS.has(property)) {
+                return (...args: any[]) => callStatusRead(property, args)
+              }
               const pending = pendingGadgetStubRef.current
               return pending
                 ? (...args: any[]) => pending.promise.then(stub => stub[property](...args))
@@ -405,12 +487,22 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
+          handshakeRecoveryAttemptsRef.current = 0
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
           if (!isCurrent()) return
           console.error('Failed to establish RPC connection:', caught)
           setError('Failed to connect gadget to server')
+          // Reacquire only the authorized owner on a known transport failure.
+          // A fresh owner reloads the failed handshake through retryConnectionFromRef;
+          // it does not replay any gadget action or reuse the closed capability.
+          if (isTransientRpcError(caught) && onRetryConnectionRef.current &&
+              handshakeRecoveryAttemptsRef.current < 2) {
+            ++handshakeRecoveryAttemptsRef.current
+            retryConnectionFromRef.current = gadgetRef.current
+            onRetryConnectionRef.current()
+          }
         } finally {
           if (handshakePendingRef.current === generation) handshakePendingRef.current = null
         }
@@ -476,6 +568,14 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           action={
             <Banner.Action
               onClick={() => {
+                if (onRetryConnection) {
+                  // Retrying the same failed capability cannot recover an object reset.
+                  // Wait for the owner to supply its freshly authorized replacement.
+                  ++loadGenerationRef.current
+                  retryConnectionFromRef.current = gadget
+                  onRetryConnection()
+                  return
+                }
                 setError(null)
                 setHasLoaded(false)
                 setIsInvalidated(false)
@@ -526,7 +626,14 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   }
 
   return (
-    <div style={{ height, width: '100%' }}>
+    <div className="flex min-h-0 flex-col" style={{ height, width: '100%' }}>
+      {onRetryConnection && (
+        <div className="flex shrink-0 justify-end border-b border-kumo-line bg-kumo-base px-2 py-1">
+          <Button variant="secondary" onClick={onRetryConnection}>
+            Reconnect view
+          </Button>
+        </div>
+      )}
       <iframe
         key={`${reloadTrigger}:${iframeGeneration}`}
         ref={iframeRef}
@@ -534,7 +641,8 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
         style={{
           display: 'block',
           width: '100%',
-          height: '100%',
+          flex: 1,
+          minHeight: 0,
           border: 'none'
         }}
         sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"

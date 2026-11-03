@@ -789,6 +789,31 @@ describe("bundled blueprint TypeScript sources", () => {
   });
 
   describe("gadget library imports", () => {
+    it("inlines the one public capability ABI through its library and keeps relocation deterministic", async () => {
+      const server = `export { GADGET_CAPABILITY_BRIDGE_TOKEN } from "${LIBRARY}/capabilities/server";`;
+      const first = await sourceTree({"server.ts": server});
+      const second = await sourceTree({"deep/nested/server.ts": server});
+      const files = await readSourceFiles(first, "example/files");
+      expect(files.get("server.js")).toContain("GADGET_CAPABILITY_BRIDGE_TOKEN");
+      expect(files.get("server.js")).not.toMatch(/private\/tmp|node_modules/u);
+      expect(await readSourceFiles(join(second, "deep/nested"), "example/files")).toEqual(files);
+    });
+
+    it("does not let a blueprint import the shared capability ABI directly", async () => {
+      const abi = resolve(gadgetLibraries, "..", "..", "workshop-shared", "src", "gadget-capabilities.ts");
+      const directory = await sourceTree({"server.ts": `export { GADGET_CAPABILITY_BRIDGE_TOKEN } from ${JSON.stringify(abi)};`});
+      await expect(readSourceFiles(directory, "example/files")).rejects.toThrow("outside the blueprint's files");
+    });
+
+    it("does not broaden a library's authority to neighboring workshop-shared runtime modules", async () => {
+      const library = join(gadgetLibraries, "audit-abi-" + crypto.randomUUID());
+      await mkdir(library);
+      temporaryDirectories.push(library);
+      await writeFile(join(library, "server.ts"), 'export * from "../../../workshop-shared/src/feature-flags.ts";');
+      const directory = await sourceTree({"server.ts": `export * from "${LIBRARY}/${library.split(/[\\/]/u).at(-1)}/server";`});
+      await expect(readSourceFiles(directory, "example/files")).rejects.toThrow("outside the gadget libraries");
+    });
+
     it("inlines a library's entry and what it reaches, from libraries/", async () => {
       let directory = await sourceTree({
         "client.ts": [

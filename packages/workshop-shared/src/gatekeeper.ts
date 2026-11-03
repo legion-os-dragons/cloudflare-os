@@ -874,6 +874,22 @@ export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
  * The Gatekeeper executes as a Durable Object Facet, where it is a child of the Overseer. This
  * interface is exposed to the Overseer, not directly to the Gadget.
  */
+/** A kernel-owned alarm capability sealed to one gatekeeper facet. */
+export interface GatekeeperAlarmScheduler extends WorkerEntrypoint {
+  /** Read this facet's durable continuation deadline, if one is scheduled. */
+  getAlarm(): Promise<number | null>;
+  /** Schedule this facet's continuation; this grants no additional side-effect authority. */
+  setAlarm(timestamp: number): Promise<void>;
+  /** Cancel only this facet's continuation deadline. */
+  deleteAlarm(): Promise<void>;
+}
+
+/** Persistent lifecycle capabilities supplied by the kernel, never by a gadget. */
+export interface GatekeeperContext {
+  /** The root Durable Object's alarm scheduler for this exact facet. */
+  alarms: Fetcher<GatekeeperAlarmScheduler>;
+}
+
 export interface Gatekeeper<Session> extends DurableObject {
   /**
    * Get more info on the specific resource without actually granting access. This information is
@@ -914,7 +930,7 @@ export interface Gatekeeper<Session> extends DurableObject {
    * simulation -- it is really up to the gatekeeper author to decide what is appropriate for the
    * particular API.
    */
-  startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session>;
+  startSession(approvalQueue: RpcStub<ApprovalQueue>, context?: GatekeeperContext): Promise<Session>;
 
   /**
    * Bounded, user-specific metadata the agent uses to discover entries reachable through this
@@ -1044,7 +1060,13 @@ export interface Gatekeeper<Session> extends DurableObject {
    * ignore this parameter (and can even omit the parameter from their `applyAction()`
    * declaration).
    */
-  applyAction(action: number, cache: RpcStub<GitCache>): Promise<void>;
+  applyAction(action: number, cache: RpcStub<GitCache>, context?: GatekeeperContext): Promise<void>;
+
+  /** Resume already-authorized durable work at a deadline scheduled through context.alarms.
+   * Implementations must recheck their source authority and retain their original approval bounds.
+   * Facets cannot own physical alarms; the kernel routes only this lifecycle method.
+   */
+  continueProcessing?(context: GatekeeperContext): Promise<void>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any

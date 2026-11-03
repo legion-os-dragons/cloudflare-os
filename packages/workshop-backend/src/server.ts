@@ -21,7 +21,7 @@ import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
-import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
+import { OverseerDurableObject, GatekeeperLoopback, GadgetProjectionLoopback, GadgetCommandLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GatekeeperAlarmLoopback, GadgetAlarmLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
@@ -62,7 +62,7 @@ export { UserDirectoryDurableObject };
 export { UserDurableObject, GatekeeperConnectCallbackImpl };
 
 // Re-export entrypoint types from overseer.ts.
-export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
+export { OverseerDurableObject, GatekeeperLoopback, GadgetProjectionLoopback, GadgetCommandLoopback, GatekeeperHookLoopback, GatekeeperAlarmLoopback, GadgetAlarmLoopback,
     CodeModeTailLoopback, AgentSpawnerGatekeeper, GadgetTailLoopback,
     AgentSelfLoopback };
 
@@ -474,6 +474,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // 1. Read blueprint from KV.
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
+    for(const [name,binding]of Object.entries(kvRecord.metadata.bindings))if(binding.type==='gadgetCapability'&&(!binding.optional||bindings[name])){
+      throw Error('Gadget capability connections must be granted inside an existing workspace. Optional connections can be added after creating the gadget.');
+    }
 
     // 2. Read gzip-compressed Yjs doc from R2 and decompress.
     let codeBytes = await readBlueprintContent(this.env, blueprintId, kvRecord.metadata.version);

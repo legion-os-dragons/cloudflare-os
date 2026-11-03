@@ -399,7 +399,12 @@ export default function ResourcePicker({
   const handleConnectNew = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
+      const vendor = allVendors.find(candidate => candidate.id === vendorId)
+      if (vendor?.description.autoProvisionsAccount) {
+        await authenticatedApi.provisionAmbientAccount(vendorId)
+      } else {
+        openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
+      }
     } catch (error) {
       console.error('Failed to initiate connection:', error)
       toasts.add({ title: 'Failed to start connection flow', variant: 'error' })

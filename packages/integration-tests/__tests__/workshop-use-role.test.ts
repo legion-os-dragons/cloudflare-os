@@ -87,6 +87,7 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
   setPinned: ws => ws.setPinned(true),
   deleteSelf: ws => ws.deleteSelf(),
   createGadget: ws => ws.createGadget("App"),
+  previewGadgetUpgrade: ws => ws.previewGadgetUpgrade(1, {type: "blueprint", blueprintId: "use-denied"}),
   listTree: ws => ws.listTree(COMMIT),
   readFilesAtCommit: ws => ws.readFilesAtCommit(COMMIT, ["client.js"]),
   getCommitLog: ws => ws.getCommitLog(COMMIT),
@@ -153,8 +154,9 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
 };
 
 const deniedGadget = (chatId: number): Record<
-    Exclude<keyof GadgetClient, keyof RpcTarget | "getId" | "getTitle">,
+    Exclude<keyof GadgetClient, keyof RpcTarget | "getId" | "getTitle" | "getAccessMode">,
     (gadget: RpcStub<GadgetClient>) => unknown> => ({
+  setAccess: g => g.setAccess({visibility: "workspace"}),
   setTitle: g => g.setTitle("Title"),
   remove: g => g.remove(),
   getUiBundle: g => g.getUiBundle(chatId),
@@ -164,6 +166,9 @@ const deniedGadget = (chatId: number): Record<
   listBindings: g => g.listBindings(),
   getBinding: g => g.getBinding("DATA"),
   bind: g => g.bind("DATA", 1),
+  getCapabilityExports: g => g.getCapabilityExports(),
+  bindCapability: g => g.bindCapability("DATA", 1, {port: "read", kind: "projection", protocol: "test:1"}),
+  executeCapability: g => g.executeCapability({port: "write", kind: "command", protocol: "test:1"}, {}),
   bindWithSuggestedName: g => g.bindWithSuggestedName(1),
   unbind: g => g.unbind("DATA"),
   renameBinding: g => g.renameBinding("DATA", "OTHER"),

@@ -37,7 +37,7 @@ interface OverseerInternals {
              initiatorUserId: string): void;
   deliverAgentCallback(chatId: number, methodName: string, args: unknown[],
                        initiatorUserId: string, initiatorModelId: string): Promise<void>;
-  waitForAllAgentsToComplete(): Promise<void>;
+  runAlarmTasks(): Promise<void>;
   cancelAgent(chatId: number): void;
   submitAction(gatekeeperId: number, action: number, description: ActionDescription,
                caller: { from: "agent", chatId: number } | { from: "user" }): Promise<unknown>;
@@ -187,7 +187,9 @@ function startTurn(responses: (() => Response)[], {
       author: OWNER, type: "message", message: `Please look at ${SECRET}.`,
     });
     impl.startAgent(CHAT_ID, { profile: MODEL, config }, OWNER, OWNER_USER_ID);
-    await impl.waitForAllAgentsToComplete();
+    // Keep the originating request open through durable callback drains and the idle gap
+    // between turns, using the same keep-alive machinery as the production alarm.
+    await impl.runAlarmTasks();
   });
   let gadgetId = env.TEST_OVERSEER.idFromName(workspace).toString();
   return { workspace, gadgetId, session, ...provider };

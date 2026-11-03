@@ -393,6 +393,8 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   const getFirstUnresolvedBindingName = useCallback((assignments = draftAssignments) => {
     if (!blueprint) return null
     for (let name of Object.keys(blueprint.metadata.bindings)) {
+      const binding=blueprint.metadata.bindings[name]
+      if(binding.type==='gadgetCapability'&&binding.optional)continue
       if (!assignments[name]) return name
     }
     return null
@@ -402,6 +404,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     if (!blueprint) return
     const binding = blueprint.metadata.bindings[name]
     if (!binding) return
+    if(binding.type==='gadgetCapability')return
 
     setGatekeeperReady(prev => ({ ...prev, [name]: false }))
     collectorsRef.current.delete(name)
@@ -484,6 +487,10 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
 
     let firstUnresolved = getFirstUnresolvedBindingName()
     if (firstUnresolved) {
+      if(blueprint?.metadata.bindings[firstUnresolved].type==='gadgetCapability'){
+        setError('Add this gadget to an existing workspace to connect its required gadget resources.')
+        return
+      }
       openBindingConfigurator(firstUnresolved)
       return
     }
@@ -546,11 +553,13 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
           type: 'aiModel',
           modelId: (form as any).modelId,
         }
-      } else {
+      } else if(binding.type==='agentSpawner') {
         assignment = {
           type: 'agentSpawner',
           modelId: (form as any).modelId ?? null,
         }
+      } else {
+        throw new Error('Connect this gadget port from inside the workspace.')
       }
       setDraftAssignments(prev => ({ ...prev, [activeBindingName]: assignment }))
       setActiveBindingName(null)
@@ -1258,7 +1267,7 @@ function BlueprintBindingSummaryCard({
     ? (vendor?.description.displayName ?? binding.gatekeeperName)
     : binding.type === 'aiModel'
       ? 'AI Model'
-      : 'Agent'
+      : binding.type==='gadgetCapability'?'Gadget connection':'Agent'
   const resource = binding.type === 'gatekeeper'
     ? vendor?.supportedResources.find(r => r.urlPattern === binding.typeUrlPattern)
     : null
@@ -1289,7 +1298,7 @@ function BlueprintBindingSummaryCard({
     if (assignment.modelId === null) return 'No agent'
     return modelsByIdLabel(assignment.modelId)
   })()
-  const status = assignment ? 'Ready' : suggestion ? 'Suggested' : 'Needs setup'
+  const status = binding.type==='gadgetCapability'&&binding.optional?'Optional':assignment ? 'Ready' : suggestion ? 'Suggested' : 'Needs setup'
   const actionLabel = assignment ? 'Change' : 'Configure'
 
   function modelsByIdLabel(modelId: string) {
@@ -1322,13 +1331,13 @@ function BlueprintBindingSummaryCard({
               : detail}
         </p>
       </div>
-      <button
+      {binding.type==='gadgetCapability'?<span className="text-xs text-kumo-subtle">Connect in workspace</span>:<button
         type="button"
         onClick={onConfigure}
         className="press inline-flex h-8 cursor-pointer items-center justify-center rounded-lg border border-kumo-line bg-kumo-base px-3 text-[12px] leading-4 font-medium tracking-[-0.2px] text-kumo-default transition-colors duration-150 ease-out hover:border-kumo-fill hover:bg-kumo-tint"
       >
         {actionLabel}
-      </button>
+      </button>}
     </div>
   )
 }

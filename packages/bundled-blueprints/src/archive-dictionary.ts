@@ -44,10 +44,10 @@ export function buildArchiveDictionary(archives:readonly Uint8Array[],gzip:(snap
     const hash=createHash("sha256").update(bytes).digest("hex"),entry=candidates.get(hash);
     if(entry)entry.uses.add(index);else candidates.set(hash,{text,bytes,uses:new Set([index])});
   }
-  const dictionary=[...candidates].filter(([,value])=>value.uses.size>1).sort(([a],[b])=>a<b?-1:a>b?1:0).map(([,value])=>value);
+  const dictionary=[...candidates].filter(([,value])=>value.uses.size>1).toSorted(([a],[b])=>a<b?-1:a>b?1:0).map(([,value])=>value);
   const plans=decoded.map((archive,index):PackedArchive|null=>{
     if(archive.snapshot.byteLength>32*1024*1024||archive.content.byteLength<18||archive.content[3]!==0)return null;
-    const slices=dictionary.flatMap((file,reference)=>{if(!file.uses.has(index))return[];const at=archive.snapshot.indexOf(file.bytes);return at<0?[]:[{at,length:file.bytes.byteLength,reference}];}).sort((a,b)=>a.at-b.at||b.length-a.length);
+    const slices=dictionary.flatMap((file,reference)=>{if(!file.uses.has(index))return[];const at=archive.snapshot.indexOf(file.bytes);return at<0?[]:[{at,length:file.bytes.byteLength,reference}];}).toSorted((a,b)=>a.at-b.at||b.length-a.length);
     const segments:(number|string)[]=[];let cursor=0,covered=0;
     for(const slice of slices){if(slice.at<cursor)continue;if(slice.at>cursor)segments.push(archive.snapshot.subarray(cursor,slice.at).toString("base64"));segments.push(slice.reference);cursor=slice.at+slice.length;covered+=slice.length;}
     if(covered<archive.snapshot.byteLength/5)return null;
@@ -58,7 +58,7 @@ export function buildArchiveDictionary(archives:readonly Uint8Array[],gzip:(snap
     const restored=restoreArchiveBytes(plan,dictionary.map(file=>file.text),[],gzip);
     return Buffer.from(restored).equals(archive.bytes)?plan:null;
   });
-  const used=[...new Set(plans.flatMap(plan=>plan?plan.segments.filter((s):s is number=>typeof s==="number"):[]))].sort((a,b)=>a-b),indices=new Map(used.map((old,index)=>[old,index]));
+  const used=[...new Set(plans.flatMap(plan=>plan?plan.segments.filter((s):s is number=>typeof s==="number"):[]))].toSorted((a,b)=>a-b),indices=new Map(used.map((old,index)=>[old,index]));
   return{files:used.map(index=>dictionary[index].text),archives:plans.map(plan=>plan?{...plan,segments:plan.segments.map(segment=>typeof segment==="number"?indices.get(segment)!:segment)}:null)};
 }
 

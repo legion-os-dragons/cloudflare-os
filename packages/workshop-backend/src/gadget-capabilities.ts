@@ -45,7 +45,10 @@ export function takeCapabilityExports(value: unknown): GadgetCapabilityExports {
   if (json === null || typeof json !== "object" || Array.isArray(json))
     throw Error("Invalid gadget capability declarations.");
   const entries = Object.entries(json);
-  if (entries.length > 64) throw Error("Too many gadget capability declarations.");
+  // Bound producer metadata independently of per-gadget connection/binding limits.
+  if (entries.length > 128) throw Error("Too many gadget capability declarations.");
+  if (new TextEncoder().encode(JSON.stringify(json)).byteLength > 64 * 1024)
+    throw Error("Gadget capability declarations are too large.");
   return Object.fromEntries(
     entries.map(([port, row]) => {
       if (

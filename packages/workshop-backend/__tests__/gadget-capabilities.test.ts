@@ -3,6 +3,7 @@ import { env, RpcTarget, RpcStub } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { GADGET_CAPABILITY_BRIDGE_TOKEN, GADGET_ALARM_BINDING } from "@gadgets/workshop-shared/gadget-capabilities";
 import type { OverseerDurableObject } from "../src/overseer";
+import { takeCapabilityExports } from "../src/gadget-capabilities";
 import { openFakeOverseer } from "./fixtures";
 const projection = { port: "facts", kind: "projection", protocol: "facts/1" } as const;
 const command = { port: "recordFact", kind: "command", protocol: "facts-command/1" } as const;
@@ -112,6 +113,14 @@ async function withWorkspace(run: (impl: any, owner: any, viewer: any) => Promis
 }
 it("grants only named matching ports and cannot bind a raw, locked, remote or cyclic gadget", () =>
   withWorkspace(async (impl, owner, viewer) => {
+    const declarations = (count: number, protocol = "facts/1") => Object.fromEntries(
+      Array.from({length:count}, (_, index) => ["facts_" + index, {kind:"projection",protocol}]),
+    );
+    expect(Object.keys(takeCapabilityExports(declarations(65)))).toHaveLength(65);
+    expect(Object.keys(takeCapabilityExports(declarations(128)))).toHaveLength(128);
+    expect(() => takeCapabilityExports(declarations(129))).toThrow("Too many");
+    expect(() => takeCapabilityExports(declarations(128, "é".repeat(256)))).toThrow("too large");
+
     const source = await owner.getGadget(1),
       target = await owner.getGadget(2);
     expect(await source.getCapabilityExports()).toEqual({

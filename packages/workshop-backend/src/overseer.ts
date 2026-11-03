@@ -1,10 +1,10 @@
-import type {GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
+import type {GadgetAlarmScheduler,GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
 import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
 import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
 import type {GadgetUpgradeSource, GadgetUpgradePreview} from '@gadgets/workshop-shared/api';
 import { gadgetAccessHash, assertGadgetAccess, guardGadgetExport } from "./gadget-access";
 import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,requireCapabilityJson,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
-import {GADGET_ALARM_BINDING,type GadgetAlarmScheduler,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
+import {GADGET_ALARM_BINDING,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";

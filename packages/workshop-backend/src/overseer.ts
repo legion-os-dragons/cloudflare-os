@@ -4,7 +4,7 @@ import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from
 import type {GadgetUpgradeSource, GadgetUpgradePreview} from '@gadgets/workshop-shared/api';
 import { gadgetAccessHash, assertGadgetAccess, guardGadgetExport } from "./gadget-access";
 import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,requireCapabilityJson,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
-import {GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
+import {GADGET_ALARM_BINDING,type GadgetAlarmScheduler,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
@@ -1257,6 +1257,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         }
       }),
 
+      gadgetContinuations: collection<{id: number; at: number; requestId: string; claim?: string; attempts?: number}>()({
+        primaryKey: "id",
+      }),
+
       gatekeeperContinuations: collection<{id: number; at: number; claim?: string}>()({
         primaryKey: "id",
       }),
@@ -1860,7 +1864,7 @@ class OverseerImpl implements AgentHooks {
   #updateAlarm(): void {
     if (this.#inAlarmHandler) return;
 
-    let times: number[] = [...this.storage.gatekeeperContinuations.list()].map(row => row.at);
+    let times: number[] = [...this.storage.gatekeeperContinuations.list(), ...this.storage.gadgetContinuations.list()].map(row => row.at);
 
     // Outstanding agent work: see #agentKeepAliveTime for why it is set once and held.
     let hasAgentWork = this.#runningAgents.size > 0 ||
@@ -1916,8 +1920,9 @@ class OverseerImpl implements AgentHooks {
         // deadlines alongside it instead of starving them until the turn ends.
         for (;;) {
           await this.runGatekeeperContinuations();
+          await this.runGadgetContinuations();
           if (settled) break;
-          const deadlines = [...this.storage.gatekeeperContinuations.list()].map(row => row.at);
+          const deadlines = [...this.storage.gatekeeperContinuations.list(), ...this.storage.gadgetContinuations.list()].map(row => row.at);
           const delay = Math.max(1000, Math.min(30000, ...deadlines.map(at => at - Date.now())));
           let wake: (() => void) | undefined;
           let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2727,7 +2732,7 @@ class OverseerImpl implements AgentHooks {
     chatId?: number,
   ): Promise<void> {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN)
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING)
       throw Error("This binding name is reserved.");
     const producer = this.getGadgetRecord(target),
       consumer = this.getGadgetRecord(gadgetId);
@@ -2957,7 +2962,7 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN) {
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING) {
       throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
@@ -3026,7 +3031,7 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN) {
+    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN || newName === GADGET_ALARM_BINDING) {
       throw new Error(`The binding name \`${newName}\` is reserved.`);
     }
     if (gadget.bindings[newName]) {
@@ -3064,6 +3069,8 @@ class OverseerImpl implements AgentHooks {
     this.revokeGadgetConnections(id);
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
+    this.storage.gadgetContinuations.delete(id);
+    this.#updateAlarm();
     this.#runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
   }
@@ -3862,6 +3869,10 @@ class OverseerImpl implements AgentHooks {
     }
     // Last, so even legacy bindings cannot shadow the producer's native-only bridge key.
     env[GADGET_CAPABILITY_BRIDGE_TOKEN] = tokens[gadgetId];
+    env[GADGET_ALARM_BINDING] = this.ctx.exports.GadgetAlarmLoopback({props: {
+      overseerId: this.ctx.id.toString(), gadgetId, accessRevision: gadget.accessRevision ?? 0,
+      ...(forChatId === undefined ? {} : {chatId: forChatId}),
+    }});
     return env;
   }
 
@@ -5426,8 +5437,21 @@ class OverseerImpl implements AgentHooks {
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
         ],
-        mainModule: "server.js",
-        modules,
+        // alarm() is a native reserved RPC method. Invoke it locally through a sealed wrapper.
+        mainModule: "__kernel_gadget_alarm.js",
+        modules: {...modules, "__kernel_gadget_alarm.js": `
+export * from "./server.js";
+import {Gadget as AuthoredGadget} from "./server.js";
+export class Gadget extends AuthoredGadget {
+  #alarmToken;
+  constructor(ctx, env) { super(ctx, env); this.#alarmToken = env.GADGET_CAPABILITY_BRIDGE_TOKEN; }
+  async __runKernelAlarm(token) {
+    if (!this.#alarmToken || token !== this.#alarmToken) throw Error("Unauthorized gadget alarm dispatch.");
+    if (typeof this.alarm !== "function") throw Error("This gadget does not implement alarm().");
+    await this.alarm();
+  }
+}
+`},
         env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
         globalOutbound: null,
 
@@ -6057,6 +6081,59 @@ class OverseerImpl implements AgentHooks {
           this.storage.gatekeeperContinuations.put({id: row.id, at: Date.now() + 300000});
         }
       }
+    }
+  }
+
+  /** Validate the sealed lifecycle capability against its gadget's current access revision. */
+  gadgetAlarm(id: number, accessRevision: number): number | null {
+    const gadget = this.getGadgetRecord(id);
+    if ((gadget.accessRevision ?? 0) !== accessRevision) throw Error("This gadget alarm capability was revoked.");
+    const deadline = this.storage.gadgetContinuations.get(id);
+    return deadline && !deadline.claim ? deadline.at : null;
+  }
+
+  /** Preview code cannot schedule durable execution until accepted. */
+  setGadgetAlarm(id: number, accessRevision: number, timestamp: number | null, chatId?: number): void {
+    this.gadgetAlarm(id, accessRevision);
+    if (chatId !== undefined || this.getGadgetRecord(id).pending)
+      throw Error("Accept this gadget's code before scheduling durable alarms.");
+    if (timestamp === null) this.storage.gadgetContinuations.delete(id);
+    else {
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > Date.now() + 366 * 86400000)
+        throw new TypeError("Invalid gadget alarm deadline.");
+      this.storage.gadgetContinuations.put({id, at: Math.max(Date.now() + 1000, timestamp), requestId: crypto.randomUUID()});
+    }
+    this.#continuationWake?.();
+    this.#updateAlarm();
+  }
+
+  /** Bounded mainline delivery, retaining a durable recovery lease before crossing a facet await. */
+  async runGadgetContinuations(): Promise<void> {
+    const due = [...this.storage.gadgetContinuations.list()]
+      .filter(row => row.at <= Date.now()).toSorted((a,b) => a.at-b.at || a.id-b.id).slice(0,4);
+    for (const row of due) {
+      const current = this.storage.gadgetContinuations.get(row.id);
+      if (!current || current.requestId !== row.requestId || current.at !== row.at || current.claim !== row.claim) continue;
+      const record = this.storage.gadgets.get(row.id);
+      if (!record || record.type !== "gadget" || record.pending) { this.storage.gadgetContinuations.delete(row.id); continue; }
+      const attempts = (row.attempts ?? 0) + 1;
+      if (attempts > 6) { this.storage.gadgetContinuations.delete(row.id); continue; }
+      const claim = crypto.randomUUID();
+      this.storage.gadgetContinuations.put({...row, at: Date.now()+300000, attempts, claim});
+      let facet: Fetcher<DurableObject> | undefined;
+      try {
+        facet = await this.getGadgetFacetFetcher(row.id);
+        const token = this.storage.gadgetCapabilityBridgeTokens.get()[row.id];
+        await (facet as Fetcher<DurableObject & {__runKernelAlarm(token: string): Promise<void>}>).__runKernelAlarm(token);
+        if (this.storage.gadgetContinuations.get(row.id)?.claim === claim) this.storage.gadgetContinuations.delete(row.id);
+      } catch {
+        // An explicit cancellation or re-arm made by the callback wins over recovery.
+        if (this.storage.gadgetContinuations.get(row.id)?.claim === claim) {
+          if (attempts >= 6) this.storage.gadgetContinuations.delete(row.id);
+          else this.storage.gadgetContinuations.put({id: row.id, at: Date.now()+Math.min(300000,1000*2**attempts), requestId: row.requestId, attempts});
+        }
+        this.logger.warn("gadget alarm delivery failed", {event: "gadget.alarm.failed", gadgetId: String(row.id)});
+      } finally { if (facet) disposeCapabilityResult(facet); }
     }
   }
 
@@ -10406,6 +10483,16 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     this.impl.setGatekeeperAlarm(id, timestamp);
   }
 
+  /** Read only the gadget deadline sealed into its lifecycle capability. */
+  getGadgetContinuationAlarm(id: number, accessRevision: number): number | null {
+    return this.impl.gadgetAlarm(id, accessRevision);
+  }
+
+  /** Update only the gadget deadline sealed into its lifecycle capability. */
+  setGadgetContinuationAlarm(id: number, accessRevision: number, timestamp: number | null, chatId?: number): void {
+    this.impl.setGadgetAlarm(id, accessRevision, timestamp, chatId);
+  }
+
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote
   // an empty Yjs snapshot as legacy code version 1; workspaces born since have no legacy code
   // log at all -- committed code exists only once a first commit lands in the git store.)
@@ -11143,6 +11230,28 @@ export class GatekeeperAlarmLoopback
   }
   deleteAlarm(): Promise<void> {
     return this.#overseer().setGatekeeperContinuationAlarm(this.ctx.props.gatekeeperId, null);
+  }
+}
+
+/** Kernel lifecycle capability sealed to one gadget and access revision. */
+export class GadgetAlarmLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, {overseerId: string; gadgetId: number; accessRevision: number; chatId?: number}>
+    implements GadgetAlarmScheduler {
+  #overseer() {
+    const ns = this.ctx.exports.OverseerDurableObject;
+    return ns.get(ns.idFromString(this.ctx.props.overseerId));
+  }
+  /** Read this gadget's requested deadline. */
+  async getAlarm(): Promise<number | null> {
+    return await this.#overseer().getGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision);
+  }
+  /** Schedule this permanent gadget's accepted-code alarm. */
+  async setAlarm(timestamp: number): Promise<void> {
+    return await this.#overseer().setGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision, timestamp, this.ctx.props.chatId);
+  }
+  /** Cancel only this gadget's wakeup. */
+  async deleteAlarm(): Promise<void> {
+    return await this.#overseer().setGadgetContinuationAlarm(this.ctx.props.gadgetId, this.ctx.props.accessRevision, null, this.ctx.props.chatId);
   }
 }
 

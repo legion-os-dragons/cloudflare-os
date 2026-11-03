@@ -1,7 +1,20 @@
 import type { RpcTarget, RpcStub } from "capnweb";
+import type { WorkerEntrypoint } from "cloudflare:workers";
 
 /** Reserved producer-only environment key. Never return its value from a gadget root. */
 export const GADGET_CAPABILITY_BRIDGE_TOKEN = "GADGET_CAPABILITY_BRIDGE_TOKEN";
+
+/** Reserved lifecycle binding sealed to one permanent gadget. */
+export const GADGET_ALARM_BINDING = "GADGET_ALARM";
+/** Durable wakeups invoke accepted mainline alarm() with no additional authority. */
+export interface GadgetAlarmScheduler extends WorkerEntrypoint<unknown> {
+  /** Read the requested deadline; recovery leases are not new requests. */
+  getAlarm(): Promise<number | null>;
+  /** Schedule this gadget only, at most 366 days ahead. */
+  setAlarm(timestamp: number): Promise<void>;
+  /** Cancel this gadget's pending wakeup and retry. */
+  deleteAlarm(): Promise<void>;
+}
 
 /** Data crossing a gadget connection. RPC capabilities and executable values are excluded. */
 export type GadgetCapabilityJson =

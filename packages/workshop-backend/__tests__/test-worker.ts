@@ -41,7 +41,7 @@ export class OverseerDurableObject extends RealOverseerDurableObject {
  */
 export { AgentSelfLoopback } from "../src/server.js";
 /** What gadget bindings, gatekeeper continuation alarms and gadget tails are minted from. */
-export { GatekeeperLoopback, GadgetProjectionLoopback, GadgetCommandLoopback, GatekeeperAlarmLoopback, GadgetTailLoopback } from "../src/server.js";
+export { GatekeeperLoopback, GadgetProjectionLoopback, GadgetCommandLoopback, GatekeeperAlarmLoopback, GadgetAlarmLoopback, GadgetTailLoopback } from "../src/server.js";
 /** What an executeCode run's tail worker is minted from, likewise. */
 export { CodeModeTailLoopback } from "../src/server.js";
 /**

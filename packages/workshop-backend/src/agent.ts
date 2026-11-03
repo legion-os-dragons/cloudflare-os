@@ -18,6 +18,8 @@ import { formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
+import type {GadgetCapabilitySpec,GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
+import { requireCapabilityJson } from './gadget-capabilities';
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
@@ -336,7 +338,7 @@ export type AgentGadgetInfo = {
    * (or created from a blueprint) have one.
    */
   isDefault: boolean;
-  bindings: {name: string, title: string, target: WorkpieceId}[];
+  bindings: {name: string, title: string, target: WorkpieceId,capability?:GadgetCapabilitySpec}[];
   /** What instantiating this gadget's blueprint produces, when it came from one that declares it. */
   output?: BlueprintOutput;
 };
@@ -379,6 +381,8 @@ async function describeBinding(
   if (!info) throw new Error(`There is no gadget named "${gadget}" in your env.`);
   // Mirrors the env getEnvForLoader builds: the gadget's own edges shadow GIT and GADGET.
   let edge = info.bindings.find(binding => binding.name === name);
+  if(edge?.capability)return `${envName} exposes only the named ${edge.capability.kind} port ${JSON.stringify(edge.capability.port)} (${edge.capability.protocol}). `+
+      (edge.capability.kind==='projection'?'Use identity(), project(JSON), and subscribe(JSON, observer.changed(revision)).':'Use identity() and execute(JSON).')+' Producer root methods are not available.';
   if (edge) return hooks.describeBinding(envName, edge.target);
   if (name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);
   if (name === "GADGET") return hooks.describeBinding(envName, info.id);
@@ -619,7 +623,10 @@ export interface AgentHooks {
    * to the chat. The caller is responsible for getting the addition recorded in the chat log (see
    * `addedBindings` on the "changes" message) so the pending edge gets sequence-stamped.
    */
-  addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number): void;
+  addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number,capability?:GadgetCapabilitySpec):void|Promise<void>;
+
+  /** Execute a named command for a build agent, attributed only to its authenticated initiator. */
+  executeGadgetCommand(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec, request: GadgetCapabilityJson, chatId: number): Promise<GadgetCapabilityJson>;
 
   /**
    * Prepare (seeding/naming lazily as needed) and return the chat's seed binding layer, including
@@ -2156,6 +2163,10 @@ async function runAgentPass(
                   // recorded no-op.
                   toolOutput = {text: jsonToolResultText({success: true})};
                   break;
+                case "executeGadgetCommand":
+                  if (toolCall.output === undefined) throw Error("executeGadgetCommand log is missing its result");
+                  toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  break;
                 case "setGadgetBinding":
                   // The recorded edge (registry state) already exists, stamped by the step's
                   // "changes" message, so replay just reproduces the recorded result.
@@ -3259,11 +3270,40 @@ async function runAgentPass(
       }
     }),
 
+    executeGadgetCommand: defineTool({
+      name: "executeGadgetCommand",
+      label: "Execute gadget command",
+      description: "Execute one explicitly exported command port on a gadget in your env. " +
+        "Use this for a standalone gadget's own canonical commands without a self-binding. " +
+        "Read its current projection first, include domain idempotency/head guards, and supply the exact declared port/protocol. " +
+        "The kernel derives the actor from the authenticated user; never supply actor/context or a bridge token.",
+      parameters: Type.Object({
+        gadget: Type.String({description: "Gadget binding name in your env."}),
+        port: Type.String(), protocol: Type.String(), request: Type.Unknown(),
+      }),
+      execute: async (toolCallId, {gadget, port, protocol, request}) => {
+        try {
+          const entry = chatBindings.get(gadget);
+          if (!entry || entry.type !== "workpiece") throw Error(`There is no gadget named "${gadget}" in your env.`);
+          const output = await hooks.executeGadgetCommand(entry.id, {port, protocol, kind: "command"}, requireCapabilityJson(request), chatId);
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
+    }),
+
     setGadgetBinding: defineTool({
       name: "setGadgetBinding",
       label: "Bind resource to gadget",
       description: SET_GADGET_BINDING_TOOL_DESCRIPTION,
       parameters: Type.Object({
+        capability:Type.Optional(Type.Object({
+          port:Type.String({description:'Explicit producer CapabilityHandler port name; required when source is another gadget.'}),
+          kind:Type.Union([Type.Literal('projection'),Type.Literal('command')]),
+          protocol:Type.String({description:'Exact versioned protocol declared by the producer.'}),
+        })),
         gadget: Type.String({
           description: "Env binding name of the gadget whose bindings to modify.",
         }),
@@ -3276,7 +3316,7 @@ async function runAgentPass(
               "own code). Defaults to the same name as `source`. Style: ALL_CAPS_WITH_UNDERSCORES.",
         })),
       }),
-      execute: async (toolCallId, {gadget, source, name}) => {
+      execute: async (toolCallId, {gadget, source, name, capability}) => {
         try {
           let gadgetEntry = chatBindings.get(gadget);
           if (!gadgetEntry || gadgetEntry.type !== "workpiece") {
@@ -3300,7 +3340,7 @@ async function runAgentPass(
           // `addedBindings`), which durably records and sequence-stamps the pending edge (see
           // addChatMessages in overseer.ts). Same-step edits share that message, so a revert
           // keeps or discards the step's work as one unit.
-          hooks.addGadgetBinding(gadgetEntry.id, bindingName, sourceEntry.id, chatId);
+          await hooks.addGadgetBinding(gadgetEntry.id, bindingName, sourceEntry.id, chatId,capability);
           pendingAddedBindings.push(
               {gadgetId: gadgetEntry.id, name: bindingName, target: sourceEntry.id});
 

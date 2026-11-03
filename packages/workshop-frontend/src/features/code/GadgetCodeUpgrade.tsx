@@ -1,6 +1,6 @@
 import {useEffect,useRef,useState} from 'react'
-import type {RpcStub} from 'capnweb'
-import type {GadgetUpgradePreview,Overseer,WorkpieceId} from '@gadgets/workshop-shared/api'
+import {RpcStub,RpcTarget} from 'capnweb'
+import type {GadgetArchiveUpload,GadgetUpgradePreview,Overseer,WorkpieceId} from '@gadgets/workshop-shared/api'
 import {useAuthenticatedApi} from '../../AuthContext'
 import {WorkshopButton} from '../../components/WorkshopControls'
 
@@ -50,6 +50,16 @@ export function GadgetCodeUpgrade({overseer,gadgetId,chatId,ready,hasChat,onCrea
   }catch(error){if(isCurrent(own,request)){setReadFailed(true);setMessage(error instanceof Error?error.message:String(error))}}
   finally{if(isCurrent(own,request))setBusy(null)}
  }
+ async function previewArchive(file:File){
+  const archive=new RpcStub<GadgetArchiveUpload>(new class extends RpcTarget implements GadgetArchiveUpload{
+   #opened=false;
+   read():ReadableStream<Uint8Array>{
+    if(this.#opened)throw new Error('This archive upload has already been read. Select the archive again.');
+    this.#opened=true;return file.stream();
+   }
+  });
+  try{await preview({type:'archive-upload',archive})}finally{archive[Symbol.dispose]()}
+ }
  const reconnect=()=>{
   if(busy==='review'||!onRetryConnection)return
   generation.current++;candidateScope.current=null;setCandidate(null);setConfirmed(false);setBusy(null);setReadFailed(true);setReconnecting(true)
@@ -69,7 +79,7 @@ export function GadgetCodeUpgrade({overseer,gadgetId,chatId,ready,hasChat,onCrea
   <WorkshopButton tone="secondary" onClick={()=>setOpen(!open)}>Import / upgrade code</WorkshopButton>
   {open&&<div className="mt-3 space-y-3">
    <p>Replace this gadget’s code through a reviewed conversation. Its identity, stored data, access policy and existing Connections are retained. Review data migrations in the imported code before accepting.</p>
-   <label className="block">Gadget archive <input type="file" accept=".gadget" disabled={busy!==null||reconnecting} onChange={event=>{const file=event.target.files?.[0];event.target.value='';if(file)void preview({type:'archive',archive:file.stream()})}}/></label>
+   <label className="block">Gadget archive <input type="file" accept=".gadget" disabled={busy!==null||reconnecting} onChange={event=>{const file=event.target.files?.[0];event.target.value='';if(file)void previewArchive(file)}}/></label>
    {libraryMessage&&<p role="status">{libraryMessage}</p>}
    <div className="flex flex-wrap gap-2"><label>Library or standard gadget <select className="rounded border border-kumo-line bg-kumo-base px-2 py-1" value={blueprint} disabled={busy!==null||reconnecting} onChange={event=>changeBlueprint(event.target.value)}><option value="">Choose a blueprint</option>{choices.map(item=><option key={item.id} value={item.id}>{item.title}</option>)}</select></label><label>Blueprint ID <input className="rounded border border-kumo-line bg-kumo-base px-2 py-1" value={blueprint} disabled={busy!==null||reconnecting} onChange={event=>changeBlueprint(event.target.value)}/></label><WorkshopButton tone="secondary" disabled={busy!==null||reconnecting||!blueprint.trim()} onClick={()=>void preview({type:'blueprint',blueprintId:blueprint.trim()})}>Preview latest published revision</WorkshopButton></div>
    {candidate&&<div className="space-y-2"><p>{candidate.title} · version {candidate.version} · {candidate.files.length} files</p><p className="break-all">Content SHA-256: {candidate.contentSha256}</p><p>Expected Connections: {candidate.requiredBindings.join(', ')||'None'}. Connections are not added or replaced by this import.</p><details><summary>Review imported files</summary><ul className="max-h-48 overflow-auto">{candidate.files.map(([path,text])=><li key={path}>{path} · {text.length.toLocaleString()} characters</li>)}</ul></details><label className="block"><input type="checkbox" checked={confirmed} onChange={event=>setConfirmed(event.target.checked)}/> Stage this complete replacement, including removal of files absent from the archive.</label><WorkshopButton tone="primary" disabled={busy!==null||reconnecting||!confirmed||(hasChat&&!ready)} onClick={()=>void review()}>{hasChat?'Stage upgrade for review':'Create upgrade review'}</WorkshopButton></div>}

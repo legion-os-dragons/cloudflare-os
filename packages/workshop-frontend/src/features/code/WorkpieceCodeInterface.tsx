@@ -257,6 +257,9 @@ export default function WorkpieceCodeInterface({
   const contentBaseRef = useRef(contentBase)
   contentBaseRef.current = contentBase
   const reviewBase = chatPin?.mergedCommit ?? acceptedCommit
+  // A replacement reviewed after a mainline update targets the merged head, not the original pin.
+  const reviewBaseRef = useRef(reviewBase)
+  reviewBaseRef.current = reviewBase
 
   // The content base's tree. A failed fetch renders an error state with a retry (the store
   // evicts failures, so bumping the token genuinely refetches); without it the pane would sit
@@ -1394,7 +1397,7 @@ export default function WorkpieceCodeInterface({
         if (requestIsCurrent()) onReviewChat(pending.chatId);
       }} onStage={(candidate: GadgetUpgradePreview) => {
         if(isEditingLocked || client === null || client.hasLocalEdits())throw new Error('Wait for this conversation to finish loading and saving.');
-        if(candidate.baseCommit !== contentBaseRef.current)throw new Error('The gadget code moved since preview. Update this conversation from mainline and preview the upgrade again.');
+        if(candidate.baseCommit !== reviewBaseRef.current)throw new Error('The gadget code moved since preview. Update this conversation from mainline and preview the upgrade again.');
         const incoming=new Map(candidate.files),changes:[string,FileChange][]=candidate.files.map(([path,text])=>[path,{set:text}]);
         for(const path of stableDisplayedFiles)if(!incoming.has(path))changes.push([path,{remove:true}]);
         const change:CodeChange={[workpieceId]:changes};validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());

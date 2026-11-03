@@ -7,6 +7,7 @@ import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
 import { GadgetDeviceState, type DeviceStateScope } from './features/gadgets/deviceState'
 import { GadgetFileActions } from './features/gadgets/fileActions'
 import { GadgetAccessSession } from './features/gadgets/accessSession'
+import { isTransientRpcError } from './rpcErrors'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -142,6 +143,10 @@ interface GadgetUIProps {
 // budget: the point at which we conclude the reply is never coming.
 const UI_BUNDLE_LOAD_TIMEOUT_MS = 20_000
 const RECONNECT_TIMEOUT_MS = 5_000
+const READ_RECONNECT_TIMEOUT_MS = 10_000
+// Only metadata reads: financial updates, submissions and approvals must never be replayed.
+// UI chunks are immutable, digest-checked code reads; retrying them cannot replay a CRM write.
+const RECOVERABLE_STATUS_READS = new Set(['documentCatalog', 'documentIntakeStatus', 'documentRefreshStatus', 'feedCursors', 'uiAssetChunk'])
 
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={`${props.chatId}:${props.deviceStateScope?.userId ?? ""}:${props.deviceStateScope?.workspaceId ?? ""}:${props.deviceStateScope?.gadgetId ?? ""}`} {...props} />
@@ -166,8 +171,11 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   // capabilities alive. Do not confuse a reconnect attempt with iframe expiry.
   const reconnectGenerationRef = useRef(0)
   const handshakePendingRef = useRef<number | null>(null)
+  const handshakeRecoveryAttemptsRef = useRef(0)
   const gadgetRef = useRef(gadget)
   gadgetRef.current = gadget
+  const onRetryConnectionRef = useRef(onRetryConnection)
+  onRetryConnectionRef.current = onRetryConnection
   // TODO: Remove `any` when Cap'n Web fixes cyclic type issues (RpcStub<any> triggers deep instantiation)
   const gadgetStubRef = useRef<any>(null)
   const pendingGadgetStubRef = useRef<{
@@ -176,6 +184,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
     reject: (reason: unknown) => void
   } | null>(null)
   const rpcSessionRef = useRef<any>(null)
+  const readRecoveryRef = useRef<Promise<any> | null>(null)
   // Keep latest callbacks in refs so the message-handler effect never tears down the RPC session.
   const onOpenConnectionsRef = useRef(onOpenConnections)
   onOpenConnectionsRef.current = onOpenConnections
@@ -210,9 +219,15 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   }
 
   const installGadgetStub = (stub: any) => {
+    const generation = connectionGenerationRef.current
     gadgetStubRef.current = stub
-    stub.onRpcBroken?.(() => {
-      if (gadgetStubRef.current === stub) suspendGadgetCalls()
+    stub.onRpcBroken?.((caught: unknown) => {
+      if (generation !== connectionGenerationRef.current ||
+          gadgetStubRef.current !== stub || pendingGadgetStubRef.current) return
+      suspendGadgetCalls()
+      // An inner WorkerLoader facet can break while the owner's WebSocket stays
+      // healthy. Reopen the authorized owner; never replay the failed call.
+      if (isTransientRpcError(caught)) onRetryConnectionRef.current?.()
     })
   }
 
@@ -222,6 +237,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
     handshakePendingRef.current = null
     pendingGadgetStubRef.current?.reject(reason)
     pendingGadgetStubRef.current = null
+    readRecoveryRef.current = null
     gadgetStubRef.current?.[Symbol.dispose]?.()
     gadgetStubRef.current = null
     rpcSessionRef.current?.[Symbol.dispose]?.()
@@ -401,12 +417,57 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             setItem: (key, value) => window.localStorage.setItem(key, value),
           }, isCurrent)
           const fileActions = new GadgetFileActions(deviceStateScope, isCurrent)
-          const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent)
+          const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
+            if (isCurrent()) onRetryConnectionRef.current?.()
+          })
           const connectionsSession = new GadgetConnectionsSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
             if(!isCurrent() || !onOpenConnectionsRef.current)return false
             onOpenConnectionsRef.current()
             return true
           })
+          const recoverStatusRead = (failedStub: any): Promise<any> => {
+            if (!isCurrent()) return Promise.reject(new Error('Gadget session has ended.'))
+            if (!pendingGadgetStubRef.current && gadgetStubRef.current !== failedStub) {
+              return Promise.resolve(gadgetStubRef.current)
+            }
+            if (readRecoveryRef.current) return readRecoveryRef.current
+            const alreadyReconnecting = pendingGadgetStubRef.current !== null
+            if (!alreadyReconnecting && !onRetryConnectionRef.current) return Promise.reject(new Error('Gadget connection recovery is unavailable.'))
+            const pending = suspendGadgetCalls()
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const recovery = Promise.race([
+              pending.promise,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                  const recoveryError = new Error('Timed out reopening gadget status reads.')
+                  if (isCurrent() && pendingGadgetStubRef.current === pending) {
+                    pendingGadgetStubRef.current = null
+                    pending.reject(recoveryError)
+                  }
+                  reject(recoveryError)
+                }, READ_RECONNECT_TIMEOUT_MS)
+              }),
+            ]).finally(() => {
+              if (timer !== undefined) clearTimeout(timer)
+              if (readRecoveryRef.current === recovery) readRecoveryRef.current = null
+            })
+            readRecoveryRef.current = recovery
+            if (!alreadyReconnecting) onRetryConnectionRef.current?.()
+            return recovery
+          }
+          const callStatusRead = async (property: string, args: any[]) => {
+            const stub = pendingGadgetStubRef.current
+              ? await recoverStatusRead(gadgetStubRef.current) : gadgetStubRef.current
+            if (!isCurrent()) throw new Error('Gadget session has ended.')
+            try {
+              return await stub[property](...args)
+            } catch (caught) {
+              if (!isCurrent() || !isTransientRpcError(caught)) throw caught
+              const replacement = await recoverStatusRead(stub)
+              if (!isCurrent()) throw new Error('Gadget session has ended.', { cause: caught })
+              return replacement[property](...args)
+            }
+          }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
               if (property === 'workshopDeviceState') return deviceState
@@ -416,6 +477,9 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               if (typeof property === 'symbol' || property in target) {
                 return Reflect.get(target, property, receiver)
               }
+              if (RECOVERABLE_STATUS_READS.has(property)) {
+                return (...args: any[]) => callStatusRead(property, args)
+              }
               const pending = pendingGadgetStubRef.current
               return pending
                 ? (...args: any[]) => pending.promise.then(stub => stub[property](...args))
@@ -423,12 +487,22 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
+          handshakeRecoveryAttemptsRef.current = 0
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
           if (!isCurrent()) return
           console.error('Failed to establish RPC connection:', caught)
           setError('Failed to connect gadget to server')
+          // Reacquire only the authorized owner on a known transport failure.
+          // A fresh owner reloads the failed handshake through retryConnectionFromRef;
+          // it does not replay any gadget action or reuse the closed capability.
+          if (isTransientRpcError(caught) && onRetryConnectionRef.current &&
+              handshakeRecoveryAttemptsRef.current < 2) {
+            ++handshakeRecoveryAttemptsRef.current
+            retryConnectionFromRef.current = gadgetRef.current
+            onRetryConnectionRef.current()
+          }
         } finally {
           if (handshakePendingRef.current === generation) handshakePendingRef.current = null
         }

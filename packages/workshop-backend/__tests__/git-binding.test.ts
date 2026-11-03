@@ -310,6 +310,7 @@ describe("env.GIT presence", () => {
     seedGadget(impl, 100);
     expect(impl.getEnvForLoader(100, { from: "gadget", gadgetId: 100 })).toEqual({
       GADGET: { type: "gadget", id: 100 },
+      GADGET_CAPABILITY_BRIDGE_TOKEN: expect.any(String),
       GIT: { type: "git" },
     });
 

@@ -12,8 +12,9 @@ async function bounded(stream:ReadableStream<Uint8Array>,limit:number){
 /** Decode an editor-selected candidate without mutating the instance or its library. */
 export async function previewGadgetCodeUpgrade(env:Pick<Cloudflare.Env,'BLUEPRINTS'|'BLUEPRINT_CONTENT'>,id:WorkpieceId,baseCommit:string,source:GadgetUpgradeSource):Promise<GadgetUpgradePreview>{
  let title:string,version:number,bindings:Record<string,unknown>,snapshot:Uint8Array;
- if(source.type==='archive'){
-  const raw=await bounded(source.archive,32*1024*1024+65536+24);
+ if(source.type==='archive'||source.type==='archive-upload'){
+  const stream=source.type==='archive-upload'?await source.archive.read():source.archive;
+  const raw=await bounded(stream,32*1024*1024+65536+24);
   const parsed=await parseBlueprintArchive(new Response(raw).body!);
   const compressed=await bounded(parsed.content,32*1024*1024);
   if(compressed.length!==parsed.contentLength)throw Error('Gadget upgrade archive length does not match its header.');

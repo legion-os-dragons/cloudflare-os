@@ -599,6 +599,8 @@ function getToolCallSummary(
           ? `${tc.input.bindingName} → ${tc.input.entrypoint}`
           : tc.input.bindingName,
       };
+    case "executeGadgetCommand":
+      return { verb: "Executed command", target: `${tc.input.gadget}: ${tc.input.port}` };
     case "setGadgetBinding":
       return {
         verb: "Wired up",
@@ -730,6 +732,8 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
       return `Inspected ${pluralize(count, "binding")}`;
     case "setBindingHook":
       return `Connected ${pluralize(count, "binding")}`;
+    case "executeGadgetCommand":
+      return `Executed ${pluralize(count, "gadget command")}`;
     case "setGadgetBinding":
       return `Wired up ${pluralize(count, "binding")}`;
     case "saveCapsuleAsBinding":
@@ -772,6 +776,8 @@ function getToolIcon(
     case "grep":
     case "describeBinding":
       return MagnifyingGlass;
+    case "executeGadgetCommand":
+      return Terminal;
     case "setBindingHook":
     case "setGadgetBinding":
     case "saveCapsuleAsBinding":
@@ -805,6 +811,8 @@ function getProvisionalToolLabel(toolName: AiToolCall["toolName"] | null | undef
       return "Inspecting binding";
     case "setBindingHook":
       return "Connecting binding";
+    case "executeGadgetCommand":
+      return "Executing gadget command";
     case "setGadgetBinding":
       return "Wiring up binding";
     case "saveCapsuleAsBinding":
@@ -839,6 +847,7 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
     case "grep": return "Searching";
     case "describeBinding": return "Inspecting";
     case "setBindingHook": return "Connecting";
+    case "executeGadgetCommand": return "Executing command";
     case "setGadgetBinding": return "Wiring up";
     case "saveCapsuleAsBinding": return "Saving";
     case "createGadget": return "Creating gadget";
@@ -867,6 +876,7 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
     case "executeCode": return count === 1 ? "Running code" : `Running code ${formatTimes(count)}`;
     case "describeBinding": return `Inspecting ${pluralize(count, "binding")}`;
     case "setBindingHook": return `Connecting ${pluralize(count, "binding")}`;
+    case "executeGadgetCommand": return `Executing ${pluralize(count, "gadget command")}`;
     case "setGadgetBinding": return `Wiring up ${pluralize(count, "binding")}`;
     case "saveCapsuleAsBinding": return `Saving ${pluralize(count, "resource")}`;
     case "createGadget": return `Creating ${pluralize(count, "gadget")}`;

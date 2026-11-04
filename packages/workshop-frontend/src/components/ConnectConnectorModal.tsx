@@ -28,6 +28,8 @@ interface ConnectConnectorModalProps {
   credentialsValid?: boolean
   disconnecting?: boolean
   onDisconnect?: () => void
+  onReconnect?: () => void
+  reconnecting?: boolean
   grantedResourceUrlPatterns?: string[]
   // Manage mode: invoked to expand the grant to include the given resource `urlPattern`s.
   onEnsureResources?: (resourceUrlPatterns: string[]) => void
@@ -50,6 +52,8 @@ export default function ConnectConnectorModal({
   credentialsValid = true,
   disconnecting = false,
   onDisconnect,
+  onReconnect,
+  reconnecting = false,
   grantedResourceUrlPatterns,
   onEnsureResources,
   ensuringResourceUrlPatterns = [],
@@ -176,7 +180,7 @@ export default function ConnectConnectorModal({
     )
   )
 
-  const busy = connecting || disconnecting
+  const busy = connecting || disconnecting || reconnecting
 
   // Resource icon helper shared by every resource row.
   function resourceIcon(resource?: SupportedResource) {
@@ -392,6 +396,11 @@ export default function ConnectConnectorModal({
                   </>
                 ) : (
                   <>
+                    {onReconnect && (
+                      <WorkshopButton onClick={onReconnect} disabled={busy} className="!h-9">
+                        {reconnecting ? 'Opening...' : 'Reconnect'}
+                      </WorkshopButton>
+                    )}
                     <Dialog.Close
                       render={(props) => (
                         <WorkshopButton {...props} className="!h-9">

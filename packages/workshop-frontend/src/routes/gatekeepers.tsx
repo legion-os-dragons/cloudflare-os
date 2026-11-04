@@ -866,6 +866,10 @@ function ConnectorsPage() {
           ensuringResourceUrlPatterns={ensuringResourceUrlPatterns}
           disconnecting={disconnecting}
           onDisconnect={handleDisconnect}
+          onReconnect={activeAccount && !activeVendor.description.autoProvisionsAccount
+            ? () => handleReconnect(activeAccount.id)
+            : undefined}
+          reconnecting={activeAccount?.id === reconnectingAccountId}
           onOpenChange={(open) => {
             if (!open && !connecting && !disconnecting) handleCloseModal()
           }}

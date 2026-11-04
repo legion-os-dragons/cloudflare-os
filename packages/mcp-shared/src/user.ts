@@ -45,7 +45,10 @@ export abstract class McpGatekeeperUserBase<E>
     const server = await account.getServer();
     return {
       displayName: server.serverName,
-      uniqueName: server.endpoint,
+      // MCP OAuth does not identify the upstream user or workspace. An endpoint
+      // alone therefore cannot deduplicate accounts: distinct authorized
+      // workspaces can share it. The owned account remains stable on reconnect.
+      uniqueName: `${server.endpoint}#account=${this.ctx.props.accountObjectId}`,
       avatar,
     };
   }

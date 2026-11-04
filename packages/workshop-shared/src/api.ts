@@ -239,7 +239,7 @@ const RESERVED_WORDS = new Set([
  * generated names), not enforced here.
  */
 export function validateBindingName(name: string): void {
-  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === "GADGET_REQUEST")
+  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN || (name === "GADGET_REQUEST" || name === "GADGET_AGENT"))
     throw Error("This binding name is reserved for the native gadget command bridge.");
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(

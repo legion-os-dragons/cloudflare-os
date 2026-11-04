@@ -46,6 +46,10 @@
     "./native-workspace-authority": {
       "types": "./src/native-workspace-authority.ts",
       "import": "./src/native-workspace-authority.ts"
+    },
+    "./embedded-agent": {
+      "types": "./src/embedded-agent.ts",
+      "import": "./src/embedded-agent.ts"
     }
   },
   "scripts": {

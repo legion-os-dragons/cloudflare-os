@@ -72,8 +72,14 @@ export interface NativeChatTurn {
   /** Original application system instructions. */ system?: string;
   /** Requested thinking behavior. */ thinking?: { enabled: boolean; budgetTokens?: number };
   /** Original active renderer grounding. */ grounding?: { generation: string; active: unknown };
-  /** Validated, app-owned bytes; the kernel never fetches these URLs. */
-  attachments?: { url: string; filename: string; mime: string; bytes: Uint8Array }[];
+  /** App-owned streams avoid aggregate RPC serialization limits; URLs grant no network access. */
+  attachments?: {
+    /** Original application-owned attachment label. */ url: string;
+    /** Original filename. */ filename: string;
+    /** Claimed media type, validated against the actual streamed bytes. */ mime: string;
+    /** Exact file size; each original attachment is limited to 20 MiB. */ byteLength: number;
+    /** Byte stream from the owning application's filesystem. */ stream: ReadableStream<Uint8Array>;
+  }[];
 }
 /** A subscription can only be closed. */
 export interface NativeChatLease extends RpcTarget {

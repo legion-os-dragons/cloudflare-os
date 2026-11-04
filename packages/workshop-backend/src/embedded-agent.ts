@@ -225,10 +225,39 @@ export class EmbeddedChatBroker {
           throw Error("Cannot send an empty chat message.");
         const attachments = [];
         for (const item of turn.attachments ?? []) {
-          if (item.bytes.byteLength > 20 * 1024 * 1024)
-            throw Error("The original attachment exceeds 20 MiB.");
+          if (
+            !Number.isSafeInteger(item.byteLength) ||
+            item.byteLength < 0 ||
+            item.byteLength > 20 * 1024 * 1024
+          )
+            throw Error("The original attachment exceeds 20 MiB or has an invalid size.");
+          const bytes = new Uint8Array(item.byteLength),
+            reader = item.stream.getReader();
+          let received = 0,
+            complete = false;
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) {
+                complete = true;
+                break;
+              }
+              if (
+                !(next.value instanceof Uint8Array) ||
+                next.value.byteLength > bytes.byteLength - received
+              )
+                throw Error("The attachment stream does not match its declared size.");
+              bytes.set(next.value, received);
+              received += next.value.byteLength;
+            }
+            if (received !== bytes.byteLength)
+              throw Error("The attachment stream ended before its declared size.");
+          } finally {
+            if (!complete) await reader.cancel().catch(() => {});
+            reader.releaseLock();
+          }
           const validated = validateChatAttachmentUpload(
-            { mimeType: item.mime, name: item.filename, content: item.bytes },
+            { mimeType: item.mime, name: item.filename, content: bytes },
             context.aiModel.config.provider,
             20 * 1024 * 1024,
           );
@@ -238,20 +267,20 @@ export class EmbeddedChatBroker {
           )
             throw Error("The selected model cannot accept PDF attachments.");
           const fileId = crypto.randomUUID();
-          for (let offset = 0; offset < item.bytes.byteLength; offset += 65536)
+          for (let offset = 0; offset < bytes.byteLength; offset += 65536)
             await this.impl.embeddedAttachmentStorage.put(
               `embedded-attachment:${id}:${fileId}:${offset}`,
-              item.bytes.slice(offset, offset + 65536),
+              bytes.slice(offset, offset + 65536),
             );
           await this.impl.embeddedAttachmentStorage.put(
             `embedded-attachment:${id}:${fileId}:length`,
-            item.bytes.byteLength,
+            bytes.byteLength,
           );
           attachments.push({
             id: fileId,
             mimeType: validated.mimeType,
             name: validated.name,
-            size: item.bytes.byteLength,
+            size: bytes.byteLength,
           });
         }
         await caller();

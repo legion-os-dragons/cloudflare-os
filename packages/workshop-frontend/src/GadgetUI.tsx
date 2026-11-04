@@ -120,7 +120,7 @@ const createSandboxedHtml = (jsCode: string): string => {
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src 'self' data:; font-src data:; script-src data: 'unsafe-inline'; style-src data: 'unsafe-inline'; img-src data:; media-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src 'self' data:; font-src data:; script-src data: 'unsafe-inline' 'wasm-unsafe-eval'; worker-src data:; style-src data: 'unsafe-inline'; img-src data:; media-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src data:;">
 </head>
 <body>
     <script type="module" src="data:text/javascript;charset=utf-8,${INJECTED_CODE_PREFIX}${encodeURIComponent(jsCode)}"></script>

@@ -3,7 +3,7 @@ type Part = {path:string;byteLength:number;sha256:string};
 type Module = {name:string;type:'esm'|'wasm';byteLength:number;sha256:string;parts:Part[]};
 const digest=async(bytes:Uint8Array)=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),value=>value.toString(16).padStart(2,'0')).join('');
 const validHash=(value:unknown):value is string=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
-const validPath=(value:unknown):value is string=>typeof value==='string'&&/^[A-Za-z0-9_.\/-]+$/.test(value)&&!value.startsWith('/')&&!value.split('/').some(part=>!part||part==='.'||part==='..');
+const validPath=(value:unknown):value is string=>typeof value==='string'&&/^[A-Za-z0-9_./-]+$/.test(value)&&!value.startsWith('/')&&!value.split('/').some(part=>!part||part==='.'||part==='..');
 
 export async function readCompiledModules(files:ReadonlyMap<string,string>):Promise<WorkerLoaderWorkerCode['modules']>{
   const text=files.get('runtime.modules.json');

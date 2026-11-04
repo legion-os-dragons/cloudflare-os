@@ -46,6 +46,10 @@
     "./embedded-agent": {
       "types": "./src/embedded-agent.ts",
       "import": "./src/embedded-agent.ts"
+    },
+    "./file-actions": {
+      "types": "./src/file-actions.ts",
+      "import": "./src/file-actions.ts"
     }
   },
   "scripts": {

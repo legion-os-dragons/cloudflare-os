@@ -115,6 +115,7 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
   listChats: ws => ws.listChats(),
   listModels: ws => ws.listModels(),
   getChatHistory: ws => ws.getChatHistory(1),
+  readChatCodeSnapshot: ws => ws.readChatCodeSnapshot(1, 1, ["client.js"]),
   getChatMessage: ws => ws.getChatMessage(1, 0),
   subscribeToChat: async ws => {
     using sink = stubFor(new ChatSink());
@@ -156,6 +157,9 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
 const deniedGadget = (chatId: number): Record<
     Exclude<keyof GadgetClient, keyof RpcTarget | "getId" | "getTitle" | "getAccessMode">,
     (gadget: RpcStub<GadgetClient>) => unknown> => ({
+  // Request dispatch is a mainline UI surface; a draft chat remains builder-only.
+  dispatchRequest: g => g.dispatchRequest({}, chatId),
+  queryCapability: g => g.queryCapability({port: "read", kind: "projection", protocol: "test:1"}, {}),
   setAccess: g => g.setAccess({visibility: "workspace"}),
   setTitle: g => g.setTitle("Title"),
   remove: g => g.remove(),

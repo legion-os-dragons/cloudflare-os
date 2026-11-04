@@ -1,4 +1,6 @@
 import { RpcTarget } from 'capnweb'
+import { createSHA256 } from 'hash-wasm'
+import type { DownloadRequest, DownloadChunk, DownloadReceipt, DownloadSession } from '@gadgets/workshop-shared/file-actions'
 import type { DeviceStateScope } from './deviceState'
 
 export type FileActionResult = { status: 'available'; value: { action: 'download-requested' | 'preview-opened' | 'print-opened'; filename?: string } } | { status: 'failed' | 'unavailable'; reason: string }
@@ -34,13 +36,103 @@ export function sanitizePrintHtml(html: string, doc: Document = document): strin
   for (const child of template.content.childNodes) copy(child, output)
   return output.innerHTML
 }
+const MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
+const MAX_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+const MAX_DOWNLOAD_SESSIONS = 2
+const DOWNLOAD_IDLE_MS = 120000
+const downloadMimeTypes = new Set([
+  'text/csv', 'text/tab-separated-values', 'text/plain', 'text/markdown', 'text/x-markdown',
+  'application/json', 'application/pdf', 'application/vnd.sqlite3', 'application/x-sqlite3',
+  'application/sqlite3', 'application/gzip', 'application/x-gzip', 'application/octet-stream',
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp',
+  'image/tiff', 'image/x-icon', 'image/vnd.microsoft.icon',
+])
+function validateDownload(request: DownloadRequest): void {
+  if (!request || typeof request.filename !== 'string' || request.filename.length < 1 || request.filename.length > 1024 || /[/\\]/.test(request.filename) || Array.from(request.filename).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127) || request.filename === '.' || request.filename === '..') throw Error('The download filename is invalid.')
+  if (typeof request.mediaType !== 'string' || request.mediaType.length > 240 || Array.from(request.mediaType).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) throw Error('The download media type is invalid.')
+  const base = request.mediaType.split(';')[0].trim().toLowerCase()
+  if (!downloadMimeTypes.has(base) && !/^(?:audio|video)\/[a-z0-9.+-]+$/.test(base)) throw Error('The download media type is not supported.')
+  if (!Number.isSafeInteger(request.byteLength) || request.byteLength < 0 || request.byteLength > MAX_DOWNLOAD_BYTES) throw Error('The download exceeds its one-GiB size limit.')
+}
+/** One file only: no preview, scripts, parent DOM access or network authority. */
+class StreamingDownload extends RpcTarget implements DownloadSession {
+  readonly #request: DownloadRequest
+  readonly #checkCurrent: () => void
+  readonly #released: () => void
+  #hasher: Awaited<ReturnType<typeof createSHA256>> | undefined
+  #parts: Blob[] = []
+  #partBuffer: Uint8Array<ArrayBuffer> | undefined = new Uint8Array(MAX_DOWNLOAD_CHUNK_BYTES)
+  #partBytes = 0
+  #received = 0
+  #busy = false
+  #closed = false
+  #idle: ReturnType<typeof setTimeout> | undefined
+  constructor(request: DownloadRequest, hasher: Awaited<ReturnType<typeof createSHA256>>, checkCurrent: () => void, released: () => void) {
+    super(); this.#request = { ...request }; this.#hasher = hasher.init(); this.#checkCurrent = checkCurrent; this.#released = released; this.#touch()
+  }
+  #touch(): void { clearTimeout(this.#idle); this.#idle = setTimeout(() => this.#release(), DOWNLOAD_IDLE_MS) }
+  #check(): void { this.#checkCurrent(); if (this.#closed) throw Error('The download session has ended.') }
+  #release(): void {
+    if (this.#closed) return
+    this.#closed = true; clearTimeout(this.#idle); this.#idle = undefined; this.#parts.length = 0; this.#partBuffer?.fill(0); this.#partBuffer = undefined; this.#partBytes = 0; this.#hasher = undefined; this.#released()
+  }
+  async write(request: DownloadChunk): Promise<{ received: number }> {
+    try {
+      this.#check(); if (this.#busy) throw Error('Download chunks must be written sequentially.'); this.#busy = true
+      if (!request || !Number.isSafeInteger(request.offset) || request.offset !== this.#received || typeof request.base64 !== 'string' || !request.base64.length || request.base64.length > Math.ceil(MAX_DOWNLOAD_CHUNK_BYTES / 3) * 4 || request.base64.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(request.base64) || typeof request.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(request.sha256)) throw Error('The download chunk is invalid.')
+      const raw = atob(request.base64), bytes = Uint8Array.from(raw, character => character.charCodeAt(0))
+      if (!bytes.byteLength || bytes.byteLength > MAX_DOWNLOAD_CHUNK_BYTES || this.#received + bytes.byteLength > this.#request.byteLength || btoa(raw) !== request.base64) throw Error('The download chunk has invalid bounds or encoding.')
+      const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), byte => byte.toString(16).padStart(2, '0')).join('')
+      this.#check(); if (digest !== request.sha256) throw Error('The download chunk does not match its digest.')
+      this.#hasher!.update(bytes)
+      for (let offset = 0; offset < bytes.byteLength;) {
+        const length = Math.min(MAX_DOWNLOAD_CHUNK_BYTES - this.#partBytes, bytes.byteLength - offset)
+        this.#partBuffer!.set(bytes.subarray(offset, offset + length), this.#partBytes); this.#partBytes += length; offset += length
+        if (this.#partBytes === MAX_DOWNLOAD_CHUNK_BYTES) { this.#parts.push(new Blob([this.#partBuffer!])); this.#partBytes = 0 }
+      }
+      this.#received += bytes.byteLength; this.#touch()
+      return { received: this.#received }
+    } catch (error) { this.#release(); throw error } finally { this.#busy = false }
+  }
+  async finish(): Promise<DownloadReceipt> {
+    let url: string | undefined
+    try {
+      this.#check(); if (this.#busy) throw Error('A download chunk is still being verified.')
+      if (this.#received !== this.#request.byteLength) throw Error('The download does not contain its exact declared bytes.')
+      if (this.#partBytes) this.#parts.push(new Blob([this.#partBuffer!.subarray(0, this.#partBytes)]))
+      const sha256 = this.#hasher!.digest('hex'), blob = new Blob(this.#parts, { type: this.#request.mediaType })
+      if (blob.size !== this.#request.byteLength) throw Error('The assembled download length is invalid.')
+      this.#check(); url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a'); anchor.href = url; anchor.download = this.#request.filename
+      document.body.appendChild(anchor)
+      try { this.#check(); anchor.click() } finally { anchor.remove() }
+      const requestedUrl = url; setTimeout(() => URL.revokeObjectURL(requestedUrl), 1000); url = undefined
+      return { status: 'available', value: { action: 'download-requested', filename: this.#request.filename, byteLength: blob.size, sha256 } }
+    } finally { if (url) URL.revokeObjectURL(url); this.#release() }
+  }
+  async abort(): Promise<void> { this.#release(); this.#checkCurrent() }
+  [Symbol.dispose](): void { this.#release() }
+}
 export class GadgetFileActions extends RpcTarget {
   #current: () => boolean
   #scoped: boolean
+  #openingDownloads = 0
+  readonly #downloads = new Set<StreamingDownload>()
   constructor(scope: DeviceStateScope | undefined, current: () => boolean) {
     super(); this.#current = current; this.#scoped = !!scope?.userId && Number.isSafeInteger(scope.gadgetId) && scope.gadgetId >= 0
   }
   #check(): void { if (!this.#scoped || !this.#current()) throw Error('The authenticated gadget session is not available.') }
+  /** Scoped, verified download-only transfer; existing previews and PDF tools remain separate. */
+  async beginSave(request: DownloadRequest): Promise<DownloadSession> {
+    this.#check(); validateDownload(request)
+    if (this.#downloads.size + this.#openingDownloads >= MAX_DOWNLOAD_SESSIONS) throw Error('Finish or abort an existing download before opening another.')
+    this.#openingDownloads++
+    try {
+      const hasher = await createSHA256(); this.#check()
+      const session = new StreamingDownload(request, hasher, () => this.#check(), () => this.#downloads.delete(session))
+      this.#downloads.add(session); return session
+    } finally { this.#openingDownloads-- }
+  }
   async #bytes(request: FileRequest): Promise<Uint8Array<ArrayBuffer>> {
     this.#check()
     if (!request || typeof request.filename !== 'string' || (request.filename.length < 1 || request.filename.length > 180 || /[/\\]/.test(request.filename) || Array.from(request.filename).some(character => character.charCodeAt(0) < 32)) || request.filename === '.' || request.filename === '..' || !mimeTypes.has(request.mediaType)) throw Error('The file name or media type is not supported.')

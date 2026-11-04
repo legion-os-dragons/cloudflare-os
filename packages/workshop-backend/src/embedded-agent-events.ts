@@ -219,8 +219,8 @@ export class EmbeddedChatEvents {
     for (const message of rows)
       if (message.type === "message" && message.author.type !== "agent")
         userMessageId = String(message.sequence);
-    const latest = [...rows]
-      .reverse()
+    const latest = rows
+      .toReversed()
       .find((message) => message.type === "message" && message.author.type === "agent");
     if (latest) {
       const actual = this.impl.storage.chatModelData.get(

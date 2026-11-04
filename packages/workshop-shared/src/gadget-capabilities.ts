@@ -93,8 +93,29 @@ export interface GadgetRequestIdentity {
   role: "build" | "use";
   requestId: string;
 }
+/** Native account grants for this workspace, not a list of verified sessions or key holders. */
+export interface GadgetAccountDirectory {
+  /** Exact producer scope sealed by the current native request. */
+  scope: { workspaceId: string; gadgetId: number };
+  /** Records describe granted accounts, including people who have not opened the app. */
+  kind: "granted-accounts";
+  /** Completeness is relative to workspace grants; conditional admission is not asserted. */
+  availability: { complete: true; eligibility: "granted-not-session-verified"; gadgetKeyPossession: "not-evaluated" };
+  /** Actual owner and currently reachable collaborators; no synthetic people. */
+  accounts: Array<{
+    /** Actual authenticated profile identity. */ id: string;
+    /** Actual profile display name. */ name: string;
+    /** Email-shaped authenticated profile ID, never self-asserted commit attribution. */ email?: string;
+    /** Actual recorded access-grant time, when available. */ addedAt?: string;
+    /** Actual native activity time, when available; never inferred from presence. */ lastActiveAt?: string;
+    /** Distinguish unavailable source facts from never having signed in. */
+    availability: { email: "known" | "unknown"; addedAt: "known" | "unknown"; lastActiveAt: "unknown" };
+  }>;
+}
 /** Available only while a native dispatchRequest invocation is active. */
 export interface GadgetRequestContext {
   current(): Promise<GadgetRequestIdentity>;
   authorize(): Promise<void>;
+  /** Read granted native accounts using existing owner/build roster authority only. */
+  directory(): Promise<GadgetAccountDirectory>;
 }

@@ -481,6 +481,12 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
+              if (property === 'nativeClipboardWrite') return async (text: string) => {
+                if (!isCurrent()) throw new Error('Gadget session has ended.')
+                if (typeof text !== 'string') throw new Error('Clipboard content must be text.')
+                await navigator.clipboard.writeText(text)
+                if (!isCurrent()) throw new Error('Gadget session has ended.')
+              }
               if (property === 'nativeSignOut') return async () => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 if (!logoutRef.current) throw new Error('This view has no authenticated host session to sign out.')

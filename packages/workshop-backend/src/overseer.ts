@@ -2812,6 +2812,7 @@ class OverseerImpl implements AgentHooks {
     try {
       const identity = await resolveIdentity();
       using _session = {[Symbol.dispose]: this.joinSession(userId === this.ownerId ? "owner" : identity.role)};
+      this.checkChatExistsAndMaterializeChanges(chatId);
       source = await this.getGadgetFacetFetcher(gadgetId, chatId);
       await resolveIdentity();
       const token = this.storage.gadgetCapabilityBridgeTokens.get()[gadgetId];
@@ -11738,96 +11739,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return profilePromise;
   }
 
-  async dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
-    requireCapabilityJson(input);
-    if (!input || Array.isArray(input) || typeof input !== "object") throw Error("Native operation requires an object.");
-    const args = input as Record<string, any>;
-    const gadgetId = args.gadgetId;
-    const gadget = () => {
-      if (!Number.isSafeInteger(gadgetId) || gadgetId < 0) throw Error("Invalid gadget ID.");
-      return this.impl.getGadgetRecord(gadgetId);
-    };
-    const owner = {userDurableObjectId:this.impl.ownerId!,profileId:this.impl.ownerProfileId!};
-    const metadata = await this.getMetadata();
-    if (gadgetId !== undefined) gadget();
-    if (operation === "_authorize") return takeCapabilityJson({owner,role:metadata.role ?? "build"});
-    if (operation === "legion_workspace_get") return {id:metadata.id,title:metadata.title,role:this.isOwner ? "owner":"build"};
-    if (operation === "legion_gadget_list") return takeCapabilityJson({gadgets:[...this.impl.storage.gadgets.list()]
-      .filter(record=>record.type === "gadget").map(record=>({id:record.id,title:record.title,...("commitId" in record && record.commitId ? {commitId:record.commitId}:{})}))});
-    if (operation === "_inventory") {
-      if (!this.isOwner) throw Error("Only the workspace owner can inspect access.");
-      const collaborators = (await this.listCollaborators()).map(c=>({profileId:c.profile.id,displayName:c.profile.name,role:c.role ?? "build",addedBy:c.addedBy.map(e=>e.type === "user"
-        ? {type:"user",createdAt:e.created.toISOString(),role:e.role ?? "build",sharerProfileId:e.sharer,...(e.note ? {note:e.note}:{})}
-        : {type:"shareKey",createdAt:e.created.toISOString(),role:e.role ?? "build",linkId:e.keyId})}));
-      const shareLinks = (await this.listShareLinks()).map(l=>({linkId:l.linkId,role:l.role ?? "build",createdAt:l.created.toISOString(),createdByProfileId:l.createdBy.id,...(l.note ? {note:l.note}:{})}));
-      const gadgets = [...this.impl.storage.gadgets.list()].filter(r=>r.type === "gadget" && (gadgetId === undefined || r.id === gadgetId)).map(r=>({gadgetId:r.id,accessMode:("accessKeyHash" in r && r.accessKeyHash) ? "key":"workspace"}));
-      return takeCapabilityJson({owner,collaborators,shareLinks,gadgets});
-    }
-    if (operation === "legion_data_ports") {
-      gadget(); const exports=await this.impl.getCapabilityExports(gadgetId);
-      return takeCapabilityJson({ports:Object.entries(exports).map(([port,spec])=>({port,...spec}))});
-    }
-    if (operation === "legion_data_query" || operation === "legion_data_command") {
-      gadget(); const spec=args.spec;
-      if (!spec || typeof spec.port !== "string" || typeof spec.protocol !== "string" ||
-          spec.kind !== (operation === "legion_data_query" ? "projection":"command")) throw Error("Invalid declared capability spec.");
-      const result = operation === "legion_data_query"
-        ? await this.impl.queryGadgetCapability(gadgetId,spec,args.request,this.clientUserId)
-        : await this.impl.executeGadgetCapability(gadgetId,spec,args.request,this.clientUserId);
-      return {result};
-    }
-    if (operation === "legion_code_tree" || operation === "legion_code_read") {
-      const record=gadget();
-      if (!record.commitId || typeof args.commitId !== "string") throw Error("No committed gadget revision.");
-      const head=record.commitId;
-      if (!(await this.getCommitLog(head)).some(commit=>commit.oid === args.commitId)) throw Error("Commit is outside this gadget's history.");
-      if (this.impl.getGadgetRecord(gadgetId).commitId !== head) throw Error("Gadget head changed; retry the read.");
-      if (operation === "legion_code_tree") return takeCapabilityJson({entries:await this.listTree(args.commitId)});
-      if (!Array.isArray(args.paths) || args.paths.length > 64 || !args.paths.every((p:unknown)=>typeof p === "string")) throw Error("Invalid paths.");
-      const files=await this.readFilesAtCommit(args.commitId,args.paths);
-      return takeCapabilityJson({files,unansweredPaths:args.paths.filter((p:string)=>!files.some(([path])=>path === p))});
-    }
-    if (operation === "legion_code_snapshot") {
-      gadget();
-      if (!Number.isSafeInteger(args.chatId) || !Array.isArray(args.paths) || args.paths.length > 64 || !args.paths.every((p:unknown)=>typeof p === "string")) throw Error("Invalid snapshot request.");
-      const meta=this.impl.getChatMetaOrThrow(args.chatId);
-      const before=JSON.stringify(this.impl.chatCodeBase(meta));
-      const head=this.impl.getGadgetHead(gadgetId);
-      const content=await this.impl.getCurrentChatContent(args.chatId,meta);
-      const files=content.get(gadgetId) ?? (head ? await this.impl.gitStore.readCommitFiles(head):new Map<string,string>());
-      const current=this.impl.chatCodeBase(this.impl.getChatMetaOrThrow(args.chatId));
-      if (before !== JSON.stringify(current) || head !== this.impl.getGadgetHead(gadgetId)) throw Error("Code snapshot changed; retry.");
-      const codeBase={...current,pins:current.pins.filter(p=>p.gadgetId === gadgetId),...(current.prior ? {prior:{...current.prior,discontinuousGadgets:current.prior.discontinuousGadgets.filter(id=>id === gadgetId)}}:{})};
-      const resultFiles=args.paths.map((p:string)=>[p,files.has(p) ? {kind:"text",text:files.get(p)!}:{kind:"absent"}]);
-      return takeCapabilityJson({codeBase,files:resultFiles,unansweredPaths:[]});
-    }
-    if (operation === "legion_code_submit") {
-      if (!Number.isSafeInteger(args.chatId)) throw Error("Invalid chat ID.");
-      this.impl.getChatMetaOrThrow(args.chatId);
-      const submission=args.submission;
-      if (!submission || typeof submission !== "object" || !Number.isSafeInteger(submission.generation) || !Number.isSafeInteger(submission.revision) ||
-          typeof submission.clientId !== "string" || !Number.isSafeInteger(submission.seq) || !submission.change || Array.isArray(submission.change)) throw Error("Invalid code submission.");
-      for (const [key,entries] of Object.entries(submission.change)) {
-        const id=Number(key);
-        if (!Number.isSafeInteger(id) || id < 0 || String(id) !== key || !Array.isArray(entries)) throw Error("Invalid changed gadget ID.");
-        this.impl.getGadgetRecord(id);
-        for (const entry of entries) {
-          if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || !entry[1] || typeof entry[1] !== "object") throw Error("Invalid file change.");
-          const c=entry[1];
-          if ("set" in c ? typeof c.set !== "string" : "remove" in c ? c.remove !== true : !Array.isArray(c.edit)) throw Error("Invalid file change variant.");
-          if ("edit" in c && !c.edit.every((section:unknown)=>typeof section === "number" || (Array.isArray(section) && typeof section[0] === "number" && section.slice(1).every(x=>typeof x === "string")))) throw Error("Invalid text edit.");
-        }
-      }
-      if (submission.pins !== undefined) {
-        if (!Array.isArray(submission.pins)) throw Error("Invalid pins.");
-        for (const pin of submission.pins) {
-          if (!pin || !Number.isSafeInteger(pin.gadgetId) || typeof pin.baseCommit !== "string") throw Error("Invalid pin.");
-          this.impl.getGadgetRecord(pin.gadgetId);
-        }
-      }
-      return takeCapabilityJson(await this.submitCodeChange(args.chatId,submission));
-    }
-    throw Error("Unsupported native account operation.");
+  async readChatCodeSnapshot(chatId: number, gadgetId: WorkpieceId, paths: string[]) {
+    this.impl.getGadgetRecord(gadgetId);
+    if (paths.length > 64) throw Error("Too many paths.");
+    const meta = this.impl.getChatMetaOrThrow(chatId);
+    const before = JSON.stringify(this.impl.chatCodeBase(meta));
+    const head = this.impl.getGadgetHead(gadgetId);
+    const content = await this.impl.getCurrentChatContent(chatId, meta);
+    const files = content.get(gadgetId) ?? (head ? await this.impl.gitStore.readCommitFiles(head) : new Map<string,string>());
+    const codeBase = this.impl.chatCodeBase(this.impl.getChatMetaOrThrow(chatId));
+    if (before !== JSON.stringify(codeBase) || head !== this.impl.getGadgetHead(gadgetId)) throw Error("Code snapshot changed; retry.");
+    return { codeBase, files: paths.map(path => [path, files.has(path) ? {kind:"text" as const,text:files.get(path)!} : {kind:"absent" as const}] as [string, import("@gadgets/workshop-shared/api").FileAtCommit]), unansweredPaths: [] };
   }
 
   async getMetadata(): Promise<GadgetMetadata> {
@@ -13424,26 +13346,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   // --- Allowed methods ---
 
-  async dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
-    requireCapabilityJson(input);
-    if (!input || Array.isArray(input) || typeof input !== "object") throw Error("Native operation requires an object.");
-    const gadgetId = input.gadgetId;
-    if (gadgetId !== undefined) {
-      if (typeof gadgetId !== "number" || !Number.isSafeInteger(gadgetId) || gadgetId < 0) throw Error("Invalid gadget ID.");
-      const record = this.impl.getGadgetRecord(gadgetId);
-      assertGadgetAccess(record.accessKeyHash, undefined);
-      if (record.pending) throw Error("Unaccepted gadget is unavailable.");
-      this.impl.assertGadgetUseWithoutCommands(gadgetId);
-    }
-    if (operation === "_authorize") return {owner:{userDurableObjectId:this.impl.ownerId!,profileId:this.impl.ownerProfileId!},role:"use"};
-    if (operation === "legion_workspace_get") {
-      const meta=await this.getMetadata();return {id:meta.id,title:meta.title,role:"use"};
-    }
-    if (operation === "legion_gadget_list") return takeCapabilityJson({gadgets:[...this.impl.storage.gadgets.list()]
-      .filter(record=>isPublishedWorkpiece(record, false))
-      .map(record=>({id:record.id,title:record.title,...("commitId" in record && record.commitId ? {commitId:record.commitId}:{})}))});
-    this.#deny();
-  }
+  async readChatCodeSnapshot(_chatId: number, _gadgetId: WorkpieceId, _paths: string[]): Promise<never> { this.#deny(); }
 
   async getMetadata(): Promise<GadgetMetadata> {
     return {

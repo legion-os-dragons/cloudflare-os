@@ -1,3 +1,5 @@
+import type {PermissionEdge} from '@gadgets/workshop-shared/api';
+import type {GadgetAccountDirectory} from '@gadgets/workshop-shared/gadget-capabilities';
 import {EmbeddedChatBroker,EmbeddedRendererProxy} from './embedded-agent';
 
 import {prepareCodeChangeStorage} from './code-change-storage';
@@ -2799,6 +2801,25 @@ class OverseerImpl implements AgentHooks {
   get embeddedAttachmentStorage():DurableObjectStorage{return this.ctx.storage}
   restoreEmbeddedRenderer(chatId:number):Promise<NativeRpcStub<NativeRpcTarget>>{return this.ctx.restore({type:'embeddedRenderer',chatId})}
 
+  /** Read existing workspace grants under this producer's live caller authority. */
+  async nativeAccountDirectory(resolve:()=>Promise<GadgetRequestIdentity>):Promise<GadgetAccountDirectory>{
+    const before=await resolve();
+    if(before.role!=='build')throw Error('Unauthorized: native account directories require build access.');
+    if(!this.ownerId)throw Error('Workspace is unavailable.');
+    const owner=await this.users.get(this.users.idFromString(this.ownerId)).whoami();
+    const sharing=await this.getSharingManager();
+    const current=await resolve();
+    if(current.role!=='build'||current.workspaceId!==before.workspaceId||current.gadgetId!==before.gadgetId||current.actorId!==before.actorId)throw Error('Native account directory authority changed.');
+    const account=(profile:AiChatAuthorInfo,edges:PermissionEdge[]=[]):GadgetAccountDirectory['accounts'][number]=>{
+      if(profile.type!=='user'||!profile.id)throw Error('A granted native account identity is unavailable.');
+      const email=/^[^\s@]+@[^\s@]+$/.test(profile.id)?profile.id:undefined;
+      const times=edges.map(edge=>edge.created).filter(time=>time instanceof Date&&Number.isFinite(time.getTime())).map(time=>time.getTime());
+      const addedAt=times.length?new Date(Math.min(...times)).toISOString():undefined;
+      return {id:profile.id,name:profile.name,...(email?{email}:{}),...(addedAt?{addedAt}:{}),availability:{email:email?'known':'unknown',addedAt:addedAt?'known':'unknown',lastActiveAt:'unknown'}};
+    };
+    return {scope:{workspaceId:current.workspaceId,gadgetId:current.gadgetId},kind:'granted-accounts',availability:{complete:true,eligibility:'granted-not-session-verified',gadgetKeyPossession:'not-evaluated'},accounts:[account(owner),...sharing.listCollaborators().map(person=>account(person.profile,person.addedBy))]};
+  }
+
   async dispatchGadgetRequest(gadgetId: WorkpieceId, request: GadgetCapabilityJson,
       userId: string, chatId?: number, admittedHash?: string): Promise<GadgetCapabilityJson> {
     requireCapabilityJson(request);
@@ -2807,7 +2828,7 @@ class OverseerImpl implements AgentHooks {
     const requestId = crypto.randomUUID();
     let active = true;
     const resolveIdentity=async():Promise<GadgetRequestIdentity>=>{if(!active)throw Error('No active native gadget request.');const identity=await this.resolveGadgetIdentity(gadgetId,userId,revision,requestId,chatId,admittedHash);if(!active)throw Error('The native request has ended.');return identity;};
-    const guard = new GadgetRequestGuard(resolveIdentity,this.getOrCreateGadgetBridgeToken(gadgetId),this.embeddedAgents.host(resolveIdentity,admittedHash));
+    const guard = new GadgetRequestGuard(resolveIdentity,this.getOrCreateGadgetBridgeToken(gadgetId),this.embeddedAgents.host(resolveIdentity,admittedHash),()=>this.nativeAccountDirectory(resolveIdentity));
     let source: Fetcher<DurableObject> | undefined;
     try {
       const identity = await resolveIdentity();
@@ -5575,6 +5596,7 @@ const liveGuard = () => { const scope=requestContext.getStore(); if(!scope?.acti
 const nativeRequest = Object.freeze({
   async current() { const scope=requestContext.getStore(); if(!scope?.active) throw Error("No native request identity."); return scope.guard.current(); },
   async authorize() { await liveGuard().authorize(); },
+  directory:()=>liveGuard().directory(),
   async run(guard, operation) {
     if(!token || await guard.producerProof() !== token) throw Error("Unauthorized native callback scope.");
     const identity=await guard.current();
@@ -14300,9 +14322,11 @@ class GadgetRequestGuard extends NativeRpcTarget {
   readonly #resolveIdentity:()=>Promise<GadgetRequestIdentity>;
   readonly #producerToken:string|undefined;
   readonly #agentHost:NativeChatHost|undefined;
-  constructor(resolveIdentity:()=>Promise<GadgetRequestIdentity>,producerToken?:string,agentHost?:NativeChatHost){super();this.#resolveIdentity=resolveIdentity;this.#producerToken=producerToken;this.#agentHost=agentHost;}
+  readonly #directory:(()=>Promise<GadgetAccountDirectory>)|undefined;
+  constructor(resolveIdentity:()=>Promise<GadgetRequestIdentity>,producerToken?:string,agentHost?:NativeChatHost,directory?:()=>Promise<GadgetAccountDirectory>){super();this.#resolveIdentity=resolveIdentity;this.#producerToken=producerToken;this.#agentHost=agentHost;this.#directory=directory;}
   async current(): Promise<GadgetRequestIdentity> { return this.#resolveIdentity(); }
   async authorize(): Promise<void> { await this.#resolveIdentity(); }
+  async directory():Promise<GadgetAccountDirectory>{await this.authorize();if(!this.#directory)throw Error('The native account directory is unavailable.');const result=await this.#directory();await this.authorize();return result;}
   async producerProof():Promise<string>{await this.authorize();if(!this.#producerToken)throw Error("This request cannot admit a producer callback.");return this.#producerToken;}
   async #host():Promise<NativeChatHost>{await this.authorize();if(!this.#agentHost)throw Error("This gadget has no admitted embedded agent capability.");return this.#agentHost;}
   async agentModels():ReturnType<NativeChatHost["models"]>{return(await this.#host()).models();}

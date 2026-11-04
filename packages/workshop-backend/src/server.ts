@@ -1,7 +1,6 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
-import type { NativeAccountAuthority } from "@gadgets/workshop-shared/native-workspace-authority";
-import { takeCapabilityJson } from "./gadget-capabilities";
-import type { GadgetCapabilityJson } from "@gadgets/workshop-shared/gadget-capabilities";
+import { createMcpHandler } from "./incoming-mcp/transport.js";
+import { NativeMcpTools } from "./incoming-mcp/native-tools.js";
+import { AuthenticationError } from "./incoming-mcp/runtime.js";
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
@@ -624,16 +623,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let app = accounts.find((account: (typeof accounts)[number]) => account.vendorId === id && account.description.providesUi);
     if (!app) return null;
     // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
-    const allowed = (this.env.NATIVE_WORKSPACE_AUTHORITY_VENDORS ?? "").split(",").map(value => value.trim());
-    const nativeWorkspaceAuthority = app.description.providesNativeWorkspaceAuthority && allowed.includes(app.vendorId)
-      ? this.ctx.exports.AccountWorkspaceAuthority({props:{
-        userName:this.#userId.name!,userId:this.#userId.toString(),accountId:app.accountId,vendorId:app.vendorId,
-      }}) as unknown as NativeAccountAuthority : undefined;
-    return user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin(), nativeWorkspaceAuthority });
-  }
-
-  nativeAccountIdentity(): { userDurableObjectId: string; profileId: string } {
-    return {userDurableObjectId:this.#userId.toString(),profileId:this.#userId.name!};
+    return user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
   }
 
   // --- Deployment admin ---
@@ -882,7 +872,7 @@ export default {
       return handleClientErrorRequest(req, env, ctx);
     }
 
-    if (url.pathname === "/api") {
+    if (url.pathname === "/api" || url.pathname === "/api/mcp") {
       // Make sure the bundled blueprints are installed. The AdminSettings DO doesn't wake
       // merely because someone deployed, so the install needs a trigger; hanging it off API
       // traffic means a fresh deployment is provisioned by its first visitor. Fire-and-forget,
@@ -909,7 +899,7 @@ export default {
       let accessPayload: JWTPayload | undefined;
 
       if (env.CF_ACCESS_AUD) {
-        if (req.headers.get("Origin") !== url.origin) {
+        if (req.headers.get("Origin") !== url.origin && !(url.pathname === "/api/mcp" && !req.headers.has("Origin"))) {
           return new Response("Cross-origin API access not allowed.", { status: 403 });
         }
 
@@ -932,6 +922,17 @@ export default {
         abortController.abort(reason);
       };
 
+      if (url.pathname === "/api/mcp") {
+        return createMcpHandler({ authenticate: async () => {
+          const api = new PublicApiImpl(ctx, env, abortSession, accessPayload);
+          try {
+            if (accessPayload) return new NativeMcpTools(await api.authenticateFromCfAccess());
+            const match = /^Bearer ([^\s]+)$/i.exec(req.headers.get("Authorization") ?? "");
+            if (!match) throw new AuthenticationError();
+            return new NativeMcpTools(await api.authenticate(match[1]));
+          } catch { throw new AuthenticationError(); }
+        }})(req);
+      }
       return await newWorkersRpcResponse(req,
           new PublicApiImpl(ctx, env, abortSession, accessPayload),
           { abortSignal: abortController.signal });
@@ -997,29 +998,4 @@ function newWorkersWebSocketRpcResponse(
     status: 101,
     webSocket: pair[1],
   });
-}
-
-/** Restorable native entrypoint; props are minted only by authenticated Workshop code. */
-@validateRpc()
-export class AccountWorkspaceAuthority extends WorkerEntrypoint<Env, {
-  userName:string;userId:string;accountId:number;vendorId:string;
-}> {
-  async #api(): Promise<AuthenticatedApiImpl> {
-    const props = this.ctx.props;
-    const userId = this.ctx.exports.UserDurableObject.idFromName(props.userName);
-    if (userId.toString() !== props.userId) throw Error("Native account identity mismatch.");
-    await this.ctx.exports.UserDurableObject.get(userId).requireNativeAuthorityAccount(props.accountId, props.vendorId);
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, reason => {throw reason;});
-  }
-  async identity(): Promise<{userDurableObjectId:string;profileId:string}> {
-    const api = await this.#api();
-    await api.whoami();
-    return api.nativeAccountIdentity();
-  }
-  async execute(workspaceId: string, operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
-    const api = await this.#api();
-    const workspace = await api.openGadget(workspaceId);
-    try { return takeCapabilityJson(await workspace.dispatchNativeAccountOperation(operation, input)); }
-    finally { workspace[Symbol.dispose](); }
-  }
 }

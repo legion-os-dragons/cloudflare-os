@@ -40,12 +40,13 @@ export interface ToolDefinition {
   annotations: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean };
 }
 function tool(name: LegionToolName, title: string, description: string, inputSchema: Schema, readOnly = true, idempotent = true): ToolDefinition {
-  return { name, title, description, inputSchema, annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: idempotent, openWorldHint: name === "legion_data_command" || name === "legion_data_query" } };
+  return { name, title, description, inputSchema, annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: idempotent, openWorldHint: name === "legion_data_command" || name === "legion_data_query" || name === "legion_gadget_request" } };
 }
 
 export const TOOL_DEFINITIONS: Readonly<Record<LegionToolName, ToolDefinition>> = Object.freeze({
   legion_workspace_get: tool("legion_workspace_get", "Read workspace", "Read the selected workspace title and your current role. Workspace IDs route requests; they do not confer access.", object(workspaceProperties)),
   legion_gadget_list: tool("legion_gadget_list", "List gadgets", "List visible gadget workpieces and their committed code heads in this workspace.", object(workspaceProperties)),
+  legion_gadget_request: tool("legion_gadget_request", "Send native gadget request", "Send bounded JSON through the gadget's existing native request protocol. The kernel supplies the current caller context and native authorization; the producer validates its request. Requests may mutate state. Do not retry automatically after an uncertain outcome.", object({ ...gadgetProperties, chatId: position, request: {} }, ["workspaceId", "gadgetId", "request"]), false, false),
   legion_data_ports: tool("legion_data_ports", "Discover gadget data ports", "Read producer-declared projection and command ports and exact versioned protocol identifiers. Use the producer's existing typed protocol contract to construct a request.", object(gadgetProperties)),
   legion_data_query: tool("legion_data_query", "Query gadget data", "Read one explicitly exported projection using its exact port and versioned protocol. Request and result follow that producer's existing typed contract. Only finite bounded JSON is accepted.", dataSchema("projection")),
   legion_data_command: tool("legion_data_command", "Execute gadget command", "Execute one explicitly exported command using its exact port and versioned protocol. Request and result follow that producer's existing typed contract. Requires native command access. Use the producer's idempotency and outcome-recovery rules; do not automatically retry an uncertain result.", dataSchema("command"), false, false),
@@ -62,7 +63,7 @@ export function isToolName(name: string): name is LegionToolName {
 
 export function validateToolInput<N extends LegionToolName>(name: N, value: unknown): asserts value is LegionToolInputs[N] {
   assertSchema(value, TOOL_DEFINITIONS[name].inputSchema);
-  if ((name === "legion_data_query" || name === "legion_data_command") && value && typeof value === "object" && "request" in value) {
+  if ((name === "legion_data_query" || name === "legion_data_command" || name === "legion_gadget_request") && value && typeof value === "object" && "request" in value) {
     // assertJson on the whole message ran before this check.
     const json = value.request as import("./types.js").LegionJson;
     if (encodedBytes(json) > LIMITS.producerRequestBytes) throw new InputError("Producer request exceeds the supported limit.");

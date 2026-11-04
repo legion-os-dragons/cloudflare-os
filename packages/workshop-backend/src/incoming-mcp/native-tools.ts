@@ -40,6 +40,13 @@ export class NativeMcpTools implements McpToolRuntime {
           const links = await workspace.listShareLinks();
           result = {collaborators:collaborators.map(row=>({profileId:row.profile.id,displayName:row.profile.name,role:row.role??"build"})),shareLinks:links.map(row=>({linkId:row.linkId,role:row.role??"build",createdAt:row.created.toISOString()}))}; disposeCapabilityResult(collaborators); disposeCapabilityResult(links); break;
         }
+        case "legion_gadget_request": {
+          const args = input as LegionToolInputs["legion_gadget_request"];
+          using gadget = await workspace.getGadget(args.gadgetId);
+          dispatched = true;
+          result = {result: await gadget.dispatchRequest(args.request, args.chatId)};
+          break;
+        }
         case "legion_code_submit": {
           const args = input as LegionToolInputs["legion_code_submit"]; dispatched=true;
           result=await workspace.submitCodeChange(args.chatId,args.submission);break;

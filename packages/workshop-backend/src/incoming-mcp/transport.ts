@@ -141,7 +141,7 @@ export function createMcpHandler(runtime: McpRuntime): (request: Request) => Pro
         : rpcError(id, -32603, error.message);
       if (error instanceof InvocationTimeout || error instanceof LimitError) {
         if (raw.method !== "tools/call") return rpcError(id, -32603, "The operation exceeded the supported time or result limits.");
-        const effectful = isRecord(raw.params) && (raw.params.name === "legion_data_command" || raw.params.name === "legion_code_submit");
+        const effectful = isRecord(raw.params) && (raw.params.name === "legion_data_command" || raw.params.name === "legion_code_submit" || raw.params.name === "legion_gadget_request");
         return toolFailure(id, effectful ? "outcome_unknown" : "limit_exceeded", effectful
           ? "The operation did not return within the supported limits. It may have taken effect. Recover its outcome using the producer's protocol or retry an identical native code submission; do not issue a new command automatically."
           : "The operation exceeded the supported time or result limits.");

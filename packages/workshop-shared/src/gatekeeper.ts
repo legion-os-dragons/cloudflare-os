@@ -257,6 +257,12 @@ export type SupportedResource = {
   icon?: AvatarImage;
 
   /**
+   * Display-only notice that this resource rejects every collaborator observer.
+   * The UI must not offer account setup as a remedy. addObserver remains authoritative.
+   */
+  observerAccess?: "owner-only";
+
+  /**
    * If true, this resource type is independently grantable. The user can enable or disable it at
    * account-connection time, and the Workshop will request only the underlying authorization (e.g.
    * OAuth scopes) needed for the resource types they enable.

@@ -6,7 +6,7 @@ import type {
   FileAtCommit, Overseer, WorkpieceId, WorkpieceSummary, GadgetUpgradePreview, CodeChangeSubmission,
 } from '@gadgets/workshop-shared/api'
 import {
-  MAX_FILE_TEXT_LENGTH, validateCodeChangeSchema, validateCodeChangeContent, type CodeChange, type FileChange, type TextChange,
+  MAX_FILE_TEXT_LENGTH, MAX_CODE_CHANGE_SIZE, validateCodeChangeSchema, validateCodeChangeContent, type CodeChange, type FileChange, type TextChange,
 } from '@gadgets/workshop-shared/code-change'
 import { RpcStub } from 'capnweb'
 import FileBrowser, { isOpenableKind, type ExpandedDirs, type FileBrowserHandle } from './FileBrowser'
@@ -227,7 +227,7 @@ export default function WorkpieceCodeInterface({
   // sessions) always read the latest values.
   // Keep a failed first submission intact so retrying cannot create another review or
   // replay a replacement with a different idempotency identity.
-  const upgradeReviewRef = useRef<{key: string; chatId: number; submission: CodeChangeSubmission} | null>(null)
+  const upgradeReviewRef = useRef<{key:string;chatId:number;clientId:string;batches:CodeChange[];next:number;generation:number;revision:number;wire?:CodeChangeSubmission} | null>(null)
   const upgradeReviewActiveRef = useRef(true)
   useEffect(() => {
     upgradeReviewActiveRef.current = true
@@ -1383,16 +1383,28 @@ export default function WorkpieceCodeInterface({
         if (pending?.key !== key) {
           const incoming = new Map(candidate.files), changes: [string, FileChange][] = candidate.files.map(([path, text]) => [path, {set: text}]);
           for (const path of stableDisplayedFiles) if (!incoming.has(path)) changes.push([path, {remove: true}]);
-          const change: CodeChange = {[workpieceId]: changes};
-          validateCodeChangeSchema(change); validateCodeChangeContent(change, new Map());
-          const chatId = await overseer.newChat('Review code upgrade for this gadget.', null);
-          pending = {key, chatId, submission: {generation: 0, revision: 0, clientId: crypto.randomUUID(), seq: 1, pins: [{gadgetId: workpieceId, baseCommit: candidate.baseCommit}], change}};
+          const batches:CodeChange[]=[];let group:[string,FileChange][]=[];let size=0;
+          // Keep the old application usable until its new client and server land together.
+          const isEntrypoint=([path]:[string,FileChange])=>path==='client.js'||path==='server.js';
+          const entrypoints=changes.filter(isEntrypoint);
+          for(const entry of changes.filter(entry=>!isEntrypoint(entry))){const weight=entry[0].length+16+('set'in entry[1]?entry[1].set.length:0);if(group.length&&size+weight>MAX_CODE_CHANGE_SIZE/4){batches.push({[workpieceId]:group});group=[];size=0;}group.push(entry);size+=weight;}
+          if(group.length)batches.push({[workpieceId]:group});
+          if(entrypoints.length)batches.push({[workpieceId]:entrypoints});
+          for(const change of batches){validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());}
+          const chatId=await overseer.newChat('Review code upgrade for this gadget.',null);
+          pending={key,chatId,clientId:crypto.randomUUID(),batches,next:0,generation:0,revision:0};
           upgradeReviewRef.current = pending;
         }
         // Stage before navigation: changing chats can remount the importer or replace its
         // local OT client, so an Effect after navigation can silently lose the candidate.
         if (!requestIsCurrent()) throw new Error('The selected gadget changed before the review was staged. Open its review conversation before retrying.');
-        await overseer.submitCodeChange(pending.chatId, pending.submission);
+        while(pending.next<pending.batches.length){
+          if(!requestIsCurrent())throw new Error('The selected gadget changed. Reopen its package review to continue.');
+          pending.wire??={generation:pending.generation,revision:pending.revision,clientId:pending.clientId,seq:pending.next+1,pins:[{gadgetId:workpieceId,baseCommit:candidate.baseCommit}],change:pending.batches[pending.next]};
+          const position=await overseer.submitCodeChange(pending.chatId,pending.wire);
+          pending.generation=position.generation;pending.revision=position.revision;pending.next++;pending.wire=undefined;
+        }
+        await overseer.finalizeChatDraft(pending.chatId);
         upgradeReviewRef.current = null;
         if (requestIsCurrent()) onReviewChat(pending.chatId);
       }} onStage={(candidate: GadgetUpgradePreview) => {

@@ -36,8 +36,8 @@ export async function previewGadgetCodeUpgrade(env:Pick<Cloudflare.Env,'BLUEPRIN
    files.push([path,value.toString()]);
   }
   files.sort(([a],[b])=>a.localeCompare(b));if(files.length===0)throw Error('Gadget archive has no code files.');
-  const change:CodeChange={[id]:files.map(([path,text])=>[path,{set:text}])};
-  validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());
+  // An archive can contain many bounded source files; the editor submits it in bounded batches.
+  for(const [path,text]of files){const change:CodeChange={[id]:[[path,{set:text}]]};validateCodeChangeSchema(change);validateCodeChangeContent(change,new Map());}
   const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',snapshot));
   return{title,version,baseCommit,contentSha256:Array.from(digest,byte=>byte.toString(16).padStart(2,'0')).join(''),files,requiredBindings:Object.keys(bindings).toSorted()};
  }finally{doc.destroy();}

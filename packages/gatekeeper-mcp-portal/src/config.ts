@@ -180,7 +180,7 @@ export function portalResource(config: PortalConfig): SupportedResource {
     urlPattern: `${new URL(config.endpoint).origin}/*`,
     title: config.name,
     description:
-      "Tools from the servers behind this portal. Writes need approval.",
+      "Services available to your connected account.",
   };
 }
 

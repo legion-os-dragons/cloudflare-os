@@ -1,5 +1,6 @@
 import type { GadgetCapabilityJson } from '@gadgets/workshop-shared/gadget-capabilities'
 import {GadgetConnectionsSession} from './features/gadgets/connectionsSession'
+import { GadgetDictationSession } from './features/gadgets/dictationSession'
 import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner, Button } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
@@ -161,6 +162,10 @@ export default function GadgetUI(props: GadgetUIProps) {
 }
 
 function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections, onRetryConnection }: GadgetUIProps) {
+  const dictationRef = useRef<GadgetDictationSession | null>(null)
+  const visibleRef = useRef(isVisible)
+  visibleRef.current = isVisible
+  useEffect(() => { if (!isVisible) dictationRef.current?.stop() }, [isVisible])
   const auth = useOptionalAuthenticatedApi()
   const logoutRef = useRef(auth?.logout)
   logoutRef.current = auth?.logout
@@ -243,6 +248,8 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   }
 
   const resetConnection = (reason: unknown) => {
+    dictationRef.current?.stop()
+    dictationRef.current = null
     ++connectionGenerationRef.current
     ++reconnectGenerationRef.current
     handshakePendingRef.current = null
@@ -428,6 +435,8 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             setItem: (key, value) => window.localStorage.setItem(key, value),
           }, isCurrent)
           const fileActions = new GadgetFileActions(deviceStateScope, isCurrent)
+          const dictationSession = new GadgetDictationSession(() => gadgetRef.current.getAccessMode(), () => isCurrent() && visibleRef.current)
+          dictationRef.current = dictationSession
           const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
             if (isCurrent()) onRetryConnectionRef.current?.()
           })
@@ -481,25 +490,51 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
-              if (property === 'nativeClipboardWrite') return async (text: string) => {
+              if (property === 'nativeClipboardWrite') return async (content: string | { mimeType: 'image/png'; base64: string }) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                if (typeof text !== 'string') throw new Error('Clipboard content must be text.')
-                await navigator.clipboard.writeText(text)
+                if (typeof content === 'string') {
+                  await navigator.clipboard.writeText(content)
+                } else {
+                  if (!content || content.mimeType !== 'image/png' || typeof content.base64 !== 'string' ||
+                    content.base64.length > 16 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content.base64)) {
+                    throw new Error('Clipboard images must be PNG files up to 12 MiB.')
+                  }
+                  const bytes = Uint8Array.from(atob(content.base64), character => character.charCodeAt(0))
+                  const signature = [137, 80, 78, 71, 13, 10, 26, 10]
+                  if (bytes.length < signature.length || signature.some((byte, index) => bytes[index] !== byte)) {
+                    throw new Error('Clipboard image is not a PNG file.')
+                  }
+                  await navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob([bytes], { type: 'image/png' }) })])
+                }
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
               }
               if (property === 'nativeSignOut') return async () => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 if (!logoutRef.current) throw new Error('This view has no authenticated host session to sign out.')
+                dictationSession.stop()
                 logoutRef.current()
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                const result = await gadgetRef.current.dispatchRequest(request, chatId)
+                if (pendingGadgetStubRef.current) await recoverStatusRead(gadgetStubRef.current)
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                return result
+                const client = gadgetRef.current
+                const failedStub = gadgetStubRef.current
+                try {
+                  const result = await client.dispatchRequest(request, chatId)
+                  if (!isCurrent()) throw new Error('Gadget session has ended.')
+                  return result
+                } catch (caught) {
+                  if (isCurrent() && gadgetRef.current === client && isTransientRpcError(caught)) {
+                    // Reopen for the next call; never replay an uncertain write.
+                    void recoverStatusRead(failedStub).catch(() => {})
+                  }
+                  throw caught
+                }
               }
               if (property === 'workshopDeviceState') return deviceState
               if (property === 'workshopFileActions') return fileActions
+              if (property === 'workshopDictation') return dictationSession
               if (property === 'workshopAccess') return accessSession
               if (property === 'workshopConnections') return connectionsSession
               if (typeof property === 'symbol' || property in target) {

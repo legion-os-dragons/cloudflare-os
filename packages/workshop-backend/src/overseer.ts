@@ -5421,10 +5421,14 @@ class OverseerImpl implements AgentHooks {
             : new Map();
       }
 
-      let modules: Record<string, string> = {};
+      let modules: WorkerLoaderWorkerCode["modules"] = {};
       for (let [file, content] of files) {
         if (file.endsWith(".js")) {
           modules[file] = content;
+        } else if (file.endsWith(".wasm.base64")) {
+          modules[file.slice(0, -".base64".length)] = {
+            wasm: Uint8Array.fromBase64(content),
+          };
         }
       }
 
@@ -5436,10 +5440,11 @@ class OverseerImpl implements AgentHooks {
 
       return {
         // TODO: compatibility date configuration
-        compatibilityDate: "2026-02-01",
+        compatibilityDate: "2026-09-04",
         compatibilityFlags: [
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
+          "nodejs_compat",
         ],
         // alarm() is a native reserved RPC method. Invoke it locally through a sealed wrapper.
         mainModule: "__kernel_gadget_alarm.js",

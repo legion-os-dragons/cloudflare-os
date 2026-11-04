@@ -59,6 +59,7 @@ export default function ConnectConnectorModal({
   ensuringResourceUrlPatterns = [],
 }: ConnectConnectorModalProps) {
   const isManage = mode === 'manage'
+  const privateConnection = supportedResources.some(resource => resource.observerAccess === 'owner-only')
 
   // Resource types the user can individually enable/disable at connect time. Resources without
   // `grantable` are shown for information but aren't toggleable -- the account grant covers them
@@ -149,7 +150,6 @@ export default function ConnectConnectorModal({
 
   const accountDisplayName =
     accountDescription?.displayName ??
-    accountDescription?.uniqueName ??
     'Connected'
 
   const headerTitle = isManage
@@ -166,10 +166,8 @@ export default function ConnectConnectorModal({
       />
       <span className="truncate">
         {credentialsValid
-          ? accountDescription?.uniqueName
-            ? `${accountDisplayName} / ${accountDescription.uniqueName}`
-            : accountDisplayName
-          : 'Credentials expired; reconnect from the Gatekeepers page'}
+          ? accountDisplayName === vendorDescription.displayName ? 'Connected' : accountDisplayName
+          : 'Reconnect to restore access'}
       </span>
     </div>
   ) : (
@@ -248,6 +246,13 @@ export default function ConnectConnectorModal({
             </p>
           )}
 
+          {isManage && accountDescription?.uniqueName && (
+            <details className="mt-3 text-xs text-kumo-subtle">
+              <summary className="cursor-pointer">Connection details</summary>
+              <div className="mt-2 break-all font-mono select-text">{accountDescription.uniqueName}</div>
+            </details>
+          )}
+
           {supportedResources.length > 0 && (
             <div className="mt-5">
               <h3 className="mb-2 text-[12px] leading-4 font-semibold uppercase tracking-[0.6px] text-kumo-inactive">
@@ -255,7 +260,7 @@ export default function ConnectConnectorModal({
                   ? isManage
                     ? 'Resources'
                     : 'Resources to enable'
-                  : 'What this gatekeeper can do'}
+                  : 'What you can use'}
               </h3>
               <ul className="space-y-2">
                 {supportedResources.map((resource) => {
@@ -321,12 +326,12 @@ export default function ConnectConnectorModal({
                 />
                 <div className="text-[12px] leading-[17px] font-normal tracking-[-0.2px] text-kumo-default">
                   <span className="font-medium">
-                    Gatekeeper sits between {vendorDescription.displayName} and your Gadgets.
+                    Connect {vendorDescription.displayName} to your workspaces.
                   </span>{' '}
                   <span className="text-kumo-subtle">
-                    Each Gadget only sees the resources you connect. If the workspace is shared,
-                    Gatekeeper verifies other users have the required permissions before they can
-                    access those resources.
+                    {privateConnection
+                      ? 'This connection is private. Sharing a workspace does not share this account.'
+                      : 'Each workspace can use only what you connect. People you share it with need their own access.'}
                   </span>
                 </div>
               </div>
@@ -335,8 +340,9 @@ export default function ConnectConnectorModal({
 
           {isManage && (
             <div className="mt-5 rounded-lg border border-kumo-line bg-kumo-elevated px-4 py-3 text-[12px] leading-[17px] font-normal tracking-[-0.2px] text-kumo-subtle">
-              This account can be used by Gadgets you connect it to. Shared users must have the
-              required permissions before they can access those connected resources.
+              {privateConnection
+                ? 'This connection is private. Sharing a workspace does not share this account.'
+                : 'Only workspaces you connect can use this account. People you share them with need their own access.'}
             </div>
           )}
         </div>

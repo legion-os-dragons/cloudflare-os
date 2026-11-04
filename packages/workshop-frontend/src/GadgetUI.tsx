@@ -1,5 +1,6 @@
 import type { GadgetCapabilityJson } from '@gadgets/workshop-shared/gadget-capabilities'
 import {GadgetConnectionsSession} from './features/gadgets/connectionsSession'
+import { GadgetDictationSession } from './features/gadgets/dictationSession'
 import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner, Button } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
@@ -161,6 +162,10 @@ export default function GadgetUI(props: GadgetUIProps) {
 }
 
 function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections, onRetryConnection }: GadgetUIProps) {
+  const dictationRef = useRef<GadgetDictationSession | null>(null)
+  const visibleRef = useRef(isVisible)
+  visibleRef.current = isVisible
+  useEffect(() => { if (!isVisible) dictationRef.current?.stop() }, [isVisible])
   const auth = useOptionalAuthenticatedApi()
   const logoutRef = useRef(auth?.logout)
   logoutRef.current = auth?.logout
@@ -243,6 +248,8 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
   }
 
   const resetConnection = (reason: unknown) => {
+    dictationRef.current?.stop()
+    dictationRef.current = null
     ++connectionGenerationRef.current
     ++reconnectGenerationRef.current
     handshakePendingRef.current = null
@@ -428,6 +435,8 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             setItem: (key, value) => window.localStorage.setItem(key, value),
           }, isCurrent)
           const fileActions = new GadgetFileActions(deviceStateScope, isCurrent)
+          const dictationSession = new GadgetDictationSession(() => gadgetRef.current.getAccessMode(), () => isCurrent() && visibleRef.current)
+          dictationRef.current = dictationSession
           const accessSession = new GadgetAccessSession(() => gadgetRef.current.getAccessMode(), isCurrent, () => {
             if (isCurrent()) onRetryConnectionRef.current?.()
           })
@@ -502,6 +511,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               if (property === 'nativeSignOut') return async () => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 if (!logoutRef.current) throw new Error('This view has no authenticated host session to sign out.')
+                dictationSession.stop()
                 logoutRef.current()
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
@@ -524,6 +534,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               }
               if (property === 'workshopDeviceState') return deviceState
               if (property === 'workshopFileActions') return fileActions
+              if (property === 'workshopDictation') return dictationSession
               if (property === 'workshopAccess') return accessSession
               if (property === 'workshopConnections') return connectionsSession
               if (typeof property === 'symbol' || property in target) {

@@ -125,8 +125,24 @@ export function createMcpHandler(runtime: McpRuntime): (request: Request) => Pro
         assertJson(result);
         if (!isRecord(result)) throw new Error("Tool results must be objects.");
         if ((name === "legion_data_query" || name === "legion_data_command") && encodedBytes(result.result as LegionJson) > LIMITS.producerResultBytes) throw new LimitError("Producer result exceeds the supported limit.");
-        // JSON text is the compatibility fallback for clients without structured result support.
-        const wire = { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result } };
+        // Keep small-result compatibility text; large data lives once in structuredContent.
+        const makeWire = () => {
+          const text = JSON.stringify(result);
+          return { jsonrpc: "2.0", id, result: {
+            content: [{ type: "text", text: encodedBytes(text) <= 65_536 ? text : "Result available in structuredContent." }],
+            structuredContent: result,
+          } };
+        };
+        let wire = makeWire();
+        if ((name === "legion_code_read" || name === "legion_code_snapshot") && Array.isArray(result.files) && Array.isArray(result.unansweredPaths)) {
+          // Preserve native omission semantics: remaining paths are explicitly unanswered,
+          // never falsely absent. Each response must make progress on at least one file.
+          while (encodedBytes(wire) > LIMITS.responseBytes && result.files.length > 1) {
+            const omitted = result.files.pop() as [string, unknown];
+            result.unansweredPaths.unshift(omitted[0]);
+            wire = makeWire();
+          }
+        }
         assertJson(wire);
         if (encodedBytes(wire) > LIMITS.responseBytes) throw new LimitError("Tool result exceeds the supported limit.");
         return response(200, wire);

@@ -4,7 +4,7 @@ import type { GadgetCapabilityJson, GadgetCapabilitySpec } from "@gadgets/worksh
 export interface LegionToolInputs {
   legion_workspace_get: {workspaceId:string};
   legion_gadget_list: {workspaceId:string};
-  legion_gadget_request: {workspaceId:string;gadgetId:number;chatId?:number;request:GadgetCapabilityJson};
+  legion_gadget_request: {workspaceId:string;gadgetId:number;key?:string;chatId?:number;request:GadgetCapabilityJson};
   legion_data_ports: {workspaceId:string;gadgetId:number};
   legion_data_query: {workspaceId:string;gadgetId:number;spec:GadgetCapabilitySpec & {kind:"projection"};request:GadgetCapabilityJson};
   legion_data_command: {workspaceId:string;gadgetId:number;spec:GadgetCapabilitySpec & {kind:"command"};request:GadgetCapabilityJson};

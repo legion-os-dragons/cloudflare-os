@@ -3,6 +3,7 @@ import type { AuthenticatedApi, WorkpieceSummary, WorkpiecesSubscriber } from "@
 import type { LegionToolInputs, LegionToolName, LegionToolOutputs } from "./types.js";
 import type { McpToolRuntime } from "./runtime.js";
 import { McpPublicError } from "./runtime.js";
+import { assertJson, LimitError } from "./validation.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { takeCapabilityJson, takeCapabilityExports, disposeCapabilityResult } from "../gadget-capabilities.js";
 class Workpieces extends RpcTarget implements WorkpiecesSubscriber {
@@ -42,9 +43,9 @@ export class NativeMcpTools implements McpToolRuntime {
         }
         case "legion_gadget_request": {
           const args = input as LegionToolInputs["legion_gadget_request"];
-          using gadget = await workspace.getGadget(args.gadgetId);
+          using gadget = await workspace.getGadget(args.gadgetId, args.key);
           dispatched = true;
-          result = {result: await gadget.dispatchRequest(args.request, args.chatId)};
+          result = {result: takeCapabilityJson(await gadget.dispatchRequest(args.request, args.chatId))};
           break;
         }
         case "legion_code_submit": {
@@ -78,9 +79,15 @@ export class NativeMcpTools implements McpToolRuntime {
           else throw new McpPublicError("invalid_request","Unknown tool.");
         }
       }
-      return takeCapabilityJson(result) as LegionToolOutputs[N];
+      // Producer values were bounded before wrapping. Detach native typed metadata without
+      // applying a producer payload limit to the larger MCP envelope.
+      try {
+        const detached: unknown = JSON.parse(JSON.stringify(result));
+        assertJson(detached);
+        return detached as LegionToolOutputs[N];
+      } finally { disposeCapabilityResult(result); }
     }catch(error){
-      if(error instanceof McpPublicError)throw error;
+      if(error instanceof McpPublicError || error instanceof LimitError)throw error;
       if(dispatched)throw new McpPublicError("outcome_unknown","The native operation may have taken effect. Recover its outcome before retrying; code retries must use the identical submission.");
       throw new McpPublicError("access_denied","The native Workshop API did not authorize or complete this operation.");
     }

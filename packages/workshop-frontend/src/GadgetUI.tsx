@@ -1,3 +1,4 @@
+import type { GadgetCapabilityJson } from '@gadgets/workshop-shared/gadget-capabilities'
 import {GadgetConnectionsSession} from './features/gadgets/connectionsSession'
 import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner, Button } from '@cloudflare/kumo'
@@ -470,6 +471,12 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
+              if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
+                if (!isCurrent()) throw new Error('Gadget session has ended.')
+                const result = await gadgetRef.current.dispatchRequest(request)
+                if (!isCurrent()) throw new Error('Gadget session has ended.')
+                return result
+              }
               if (property === 'workshopDeviceState') return deviceState
               if (property === 'workshopFileActions') return fileActions
               if (property === 'workshopAccess') return accessSession

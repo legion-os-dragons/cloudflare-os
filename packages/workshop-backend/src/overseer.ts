@@ -5,7 +5,7 @@ import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from
 import type {GadgetUpgradeSource, GadgetUpgradePreview} from '@gadgets/workshop-shared/api';
 import { gadgetAccessHash, assertGadgetAccess, guardGadgetExport } from "./gadget-access";
 import {GadgetProjectionBroker,GadgetCommandBroker,requireCapabilityExport,requireCapabilityJson,takeCapabilityJson,takeCapabilityExports,disposeCapabilityResult} from './gadget-capabilities';
-import {GADGET_ALARM_BINDING,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson} from '@gadgets/workshop-shared/gadget-capabilities';
+import {GADGET_ALARM_BINDING,GADGET_CAPABILITY_BRIDGE_TOKEN,type GadgetCapabilityExports,type GadgetCapabilitySpec,type GadgetCapabilityJson,type GadgetRequestIdentity} from '@gadgets/workshop-shared/gadget-capabilities';
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
@@ -2716,6 +2716,70 @@ class OverseerImpl implements AgentHooks {
     } finally { disposeCapabilityResult(source); }
   }
 
+  async queryGadgetCapability(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
+      request: GadgetCapabilityJson, userId: string): Promise<GadgetCapabilityJson> {
+    if (spec.kind !== "projection") throw Error("Only a declared projection port may be queried.");
+    requireCapabilityJson(request);
+    await this.authorizeGadgetCommandBuild(userId);
+    using _session = {[Symbol.dispose]: this.joinSession(userId === this.ownerId ? "owner" : "build")};
+    const revision = this.getGadgetRecord(gadgetId).accessRevision ?? 0;
+    const authorize = async () => {
+      await this.authorizeGadgetCommandBuild(userId);
+      const gadget = this.getGadgetRecord(gadgetId);
+      if (gadget.accessKeyHash || (gadget.accessRevision ?? 0) !== revision)
+        throw Error("This gadget query authority has been revoked.");
+    };
+    const handler = this.loadGadgetWorker(gadgetId).getEntrypoint<GadgetCapabilityHandler>("CapabilityHandler");
+    requireCapabilityExport(takeCapabilityExports(await handler.describe()), spec);
+    await authorize();
+    const source = await this.getGadgetFacetFetcher(gadgetId);
+    try {
+      await authorize();
+      const result = takeCapabilityJson(await handler.project(source, spec.port, request));
+      await authorize();
+      return result;
+    } finally { disposeCapabilityResult(source); }
+  }
+
+  async dispatchGadgetRequest(gadgetId: WorkpieceId, request: GadgetCapabilityJson,
+      userId: string, admittedHash?: string): Promise<GadgetCapabilityJson> {
+    requireCapabilityJson(request);
+    const revision = this.getGadgetRecord(gadgetId).accessRevision ?? 0;
+    const requestId = crypto.randomUUID();
+    let active = true;
+    const resolveIdentity = async (): Promise<GadgetRequestIdentity> => {
+      if (!active || !this.ownerId) throw Error("No active native gadget request.");
+      const user = this.users.get(this.users.idFromString(userId));
+      const profile = await user.whoami();
+      const owner = userId === this.ownerId;
+      const role = owner ? "build" : await this.authorizeCollaborator(profile.id, user);
+      if (!role) throw Error("Workspace access denied.");
+      const currentRole = owner ? "build" : (await this.getSharingManager()).getEffectiveRole(profile.id);
+      if (!active || currentRole !== role) throw Error("Workspace authority changed during request.");
+      const record = this.getGadgetRecord(gadgetId);
+      if ((record.accessRevision ?? 0) !== revision) throw Error("Gadget request revoked.");
+      if (role === "use") {
+        assertGadgetAccess(record.accessKeyHash, admittedHash);
+        this.assertGadgetUseWithoutCommands(gadgetId);
+        if (record.pending) throw Error("Unaccepted gadget is unavailable.");
+      }
+      return {actorId:userId,profileId:profile.id,displayName:profile.name,
+        workspaceId:this.ctx.id.toString(),gadgetId,role,requestId};
+    };
+    const guard = new GadgetRequestGuard(resolveIdentity);
+    let source: Fetcher<DurableObject> | undefined;
+    try {
+      const identity = await resolveIdentity();
+      using _session = {[Symbol.dispose]: this.joinSession(userId === this.ownerId ? "owner" : identity.role)};
+      source = await this.getGadgetFacetFetcher(gadgetId);
+      await resolveIdentity();
+      const token = this.storage.gadgetCapabilityBridgeTokens.get()[gadgetId];
+      const result = takeCapabilityJson(await (source as any).__dispatchKernelRequest(token, guard, request));
+      await resolveIdentity();
+      return result;
+    } finally { active = false; if (source) disposeCapabilityResult(source); }
+  }
+
   async executeGadgetCommand(gadgetId: WorkpieceId, spec: GadgetCapabilitySpec,
       request: GadgetCapabilityJson, chatId: number): Promise<GadgetCapabilityJson> {
     const grantedBy = this.storage.activeAgents.get(chatId)?.initiatorUserId;
@@ -2733,7 +2797,7 @@ class OverseerImpl implements AgentHooks {
     chatId?: number,
   ): Promise<void> {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING)
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING || name === "GADGET_REQUEST")
       throw Error("This binding name is reserved.");
     const producer = this.getGadgetRecord(target),
       consumer = this.getGadgetRecord(gadgetId);
@@ -2963,7 +3027,7 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING) {
+    if (name === "GADGET" || name === GIT_BINDING_NAME || name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === GADGET_ALARM_BINDING || name === "GADGET_REQUEST") {
       throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
@@ -3032,7 +3096,7 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN || newName === GADGET_ALARM_BINDING) {
+    if (newName === "GADGET" || newName === GIT_BINDING_NAME || newName === GADGET_CAPABILITY_BRIDGE_TOKEN || newName === GADGET_ALARM_BINDING || newName === "GADGET_REQUEST") {
       throw new Error(`The binding name \`${newName}\` is reserved.`);
     }
     if (gadget.bindings[newName]) {
@@ -5451,9 +5515,24 @@ class OverseerImpl implements AgentHooks {
         modules: {...modules, "__kernel_gadget_alarm.js": `
 export * from "./server.js";
 import {Gadget as AuthoredGadget} from "./server.js";
+import {AsyncLocalStorage} from "node:async_hooks";
+const requestContext = new AsyncLocalStorage();
+const nativeRequest = Object.freeze({
+  async current() { const scope=requestContext.getStore(); if(!scope?.active) throw Error("No native request identity."); return scope.guard.current(); },
+  async authorize() { const scope=requestContext.getStore(); if(!scope?.active) throw Error("No native request identity."); await scope.guard.authorize(); }
+});
 export class Gadget extends AuthoredGadget {
   #alarmToken;
-  constructor(ctx, env) { super(ctx, env); this.#alarmToken = env.GADGET_CAPABILITY_BRIDGE_TOKEN; }
+  constructor(ctx, env) { super(ctx, {...env,GADGET_REQUEST:nativeRequest}); this.#alarmToken = env.GADGET_CAPABILITY_BRIDGE_TOKEN; }
+  async __dispatchKernelRequest(token, guard, request) {
+    if (!this.#alarmToken || token !== this.#alarmToken) throw Error("Unauthorized gadget request dispatch.");
+    if (typeof this.handleRequest !== "function") throw Error("Gadget does not implement handleRequest(JSON).");
+    const scope={guard,active:true};
+    return requestContext.run(scope, async()=>{
+      try { await guard.authorize(); const result=await this.handleRequest(request); await guard.authorize(); return result; }
+      finally { scope.active=false; }
+    });
+  }
   async __runKernelAlarm(token) {
     if (!this.#alarmToken || token !== this.#alarmToken) throw Error("Unauthorized gadget alarm dispatch.");
     if (typeof this.alarm !== "function") throw Error("This gadget does not implement alarm().");
@@ -9350,6 +9429,7 @@ export class Gadget extends AuthoredGadget {
 
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
+          "nodejs_als",
         ],
         mainModule: "harness.js",
         modules: {
@@ -11574,6 +11654,98 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return profilePromise;
   }
 
+  async dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    requireCapabilityJson(input);
+    if (!input || Array.isArray(input) || typeof input !== "object") throw Error("Native operation requires an object.");
+    const args = input as Record<string, any>;
+    const gadgetId = args.gadgetId;
+    const gadget = () => {
+      if (!Number.isSafeInteger(gadgetId) || gadgetId < 0) throw Error("Invalid gadget ID.");
+      return this.impl.getGadgetRecord(gadgetId);
+    };
+    const owner = {userDurableObjectId:this.impl.ownerId!,profileId:this.impl.ownerProfileId!};
+    const metadata = await this.getMetadata();
+    if (gadgetId !== undefined) gadget();
+    if (operation === "_authorize") return takeCapabilityJson({owner,role:metadata.role ?? "build"});
+    if (operation === "legion_workspace_get") return {id:metadata.id,title:metadata.title,role:this.isOwner ? "owner":"build"};
+    if (operation === "legion_gadget_list") return takeCapabilityJson({gadgets:[...this.impl.storage.gadgets.list()]
+      .filter(record=>record.type === "gadget").map(record=>({id:record.id,title:record.title,...("commitId" in record && record.commitId ? {commitId:record.commitId}:{})}))});
+    if (operation === "_inventory") {
+      if (!this.isOwner) throw Error("Only the workspace owner can inspect access.");
+      const collaborators = (await this.listCollaborators()).map(c=>({profileId:c.profile.id,displayName:c.profile.name,role:c.role ?? "build",addedBy:c.addedBy.map(e=>e.type === "user"
+        ? {type:"user",createdAt:e.created.toISOString(),role:e.role ?? "build",sharerProfileId:e.sharer,...(e.note ? {note:e.note}:{})}
+        : {type:"shareKey",createdAt:e.created.toISOString(),role:e.role ?? "build",linkId:e.keyId})}));
+      const shareLinks = (await this.listShareLinks()).map(l=>({linkId:l.linkId,role:l.role ?? "build",createdAt:l.created.toISOString(),createdByProfileId:l.createdBy.id,...(l.note ? {note:l.note}:{})}));
+      const gadgets = [...this.impl.storage.gadgets.list()].filter(r=>r.type === "gadget" && (gadgetId === undefined || r.id === gadgetId)).map(r=>({gadgetId:r.id,accessMode:("accessKeyHash" in r && r.accessKeyHash) ? "key":"workspace"}));
+      return takeCapabilityJson({owner,collaborators,shareLinks,gadgets});
+    }
+    if (operation === "legion_data_ports") {
+      gadget(); const exports=await this.impl.getCapabilityExports(gadgetId);
+      return takeCapabilityJson({ports:Object.entries(exports).map(([port,spec])=>({port,...spec}))});
+    }
+    if (operation === "legion_data_query" || operation === "legion_data_command") {
+      gadget(); const spec=args.spec;
+      if (!spec || typeof spec.port !== "string" || typeof spec.protocol !== "string" ||
+          spec.kind !== (operation === "legion_data_query" ? "projection":"command")) throw Error("Invalid declared capability spec.");
+      const result = operation === "legion_data_query"
+        ? await this.impl.queryGadgetCapability(gadgetId,spec,args.request,this.clientUserId)
+        : await this.impl.executeGadgetCapability(gadgetId,spec,args.request,this.clientUserId);
+      return {result};
+    }
+    if (operation === "legion_code_tree" || operation === "legion_code_read") {
+      const record=gadget();
+      if (!record.commitId || typeof args.commitId !== "string") throw Error("No committed gadget revision.");
+      const head=record.commitId;
+      if (!(await this.getCommitLog(head)).some(commit=>commit.oid === args.commitId)) throw Error("Commit is outside this gadget's history.");
+      if (this.impl.getGadgetRecord(gadgetId).commitId !== head) throw Error("Gadget head changed; retry the read.");
+      if (operation === "legion_code_tree") return takeCapabilityJson({entries:await this.listTree(args.commitId)});
+      if (!Array.isArray(args.paths) || args.paths.length > 64 || !args.paths.every((p:unknown)=>typeof p === "string")) throw Error("Invalid paths.");
+      const files=await this.readFilesAtCommit(args.commitId,args.paths);
+      return takeCapabilityJson({files,unansweredPaths:args.paths.filter((p:string)=>!files.some(([path])=>path === p))});
+    }
+    if (operation === "legion_code_snapshot") {
+      gadget();
+      if (!Number.isSafeInteger(args.chatId) || !Array.isArray(args.paths) || args.paths.length > 64 || !args.paths.every((p:unknown)=>typeof p === "string")) throw Error("Invalid snapshot request.");
+      const meta=this.impl.getChatMetaOrThrow(args.chatId);
+      const before=JSON.stringify(this.impl.chatCodeBase(meta));
+      const head=this.impl.getGadgetHead(gadgetId);
+      const content=await this.impl.getCurrentChatContent(args.chatId,meta);
+      const files=content.get(gadgetId) ?? (head ? await this.impl.gitStore.readCommitFiles(head):new Map<string,string>());
+      const current=this.impl.chatCodeBase(this.impl.getChatMetaOrThrow(args.chatId));
+      if (before !== JSON.stringify(current) || head !== this.impl.getGadgetHead(gadgetId)) throw Error("Code snapshot changed; retry.");
+      const codeBase={...current,pins:current.pins.filter(p=>p.gadgetId === gadgetId),...(current.prior ? {prior:{...current.prior,discontinuousGadgets:current.prior.discontinuousGadgets.filter(id=>id === gadgetId)}}:{})};
+      const resultFiles=args.paths.map((p:string)=>[p,files.has(p) ? {kind:"text",text:files.get(p)!}:{kind:"absent"}]);
+      return takeCapabilityJson({codeBase,files:resultFiles,unansweredPaths:[]});
+    }
+    if (operation === "legion_code_submit") {
+      if (!Number.isSafeInteger(args.chatId)) throw Error("Invalid chat ID.");
+      this.impl.getChatMetaOrThrow(args.chatId);
+      const submission=args.submission;
+      if (!submission || typeof submission !== "object" || !Number.isSafeInteger(submission.generation) || !Number.isSafeInteger(submission.revision) ||
+          typeof submission.clientId !== "string" || !Number.isSafeInteger(submission.seq) || !submission.change || Array.isArray(submission.change)) throw Error("Invalid code submission.");
+      for (const [key,entries] of Object.entries(submission.change)) {
+        const id=Number(key);
+        if (!Number.isSafeInteger(id) || id < 0 || String(id) !== key || !Array.isArray(entries)) throw Error("Invalid changed gadget ID.");
+        this.impl.getGadgetRecord(id);
+        for (const entry of entries) {
+          if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || !entry[1] || typeof entry[1] !== "object") throw Error("Invalid file change.");
+          const c=entry[1];
+          if ("set" in c ? typeof c.set !== "string" : "remove" in c ? c.remove !== true : !Array.isArray(c.edit)) throw Error("Invalid file change variant.");
+          if ("edit" in c && !c.edit.every((section:unknown)=>typeof section === "number" || (Array.isArray(section) && typeof section[0] === "number" && section.slice(1).every(x=>typeof x === "string")))) throw Error("Invalid text edit.");
+        }
+      }
+      if (submission.pins !== undefined) {
+        if (!Array.isArray(submission.pins)) throw Error("Invalid pins.");
+        for (const pin of submission.pins) {
+          if (!pin || !Number.isSafeInteger(pin.gadgetId) || typeof pin.baseCommit !== "string") throw Error("Invalid pin.");
+          this.impl.getGadgetRecord(pin.gadgetId);
+        }
+      }
+      return takeCapabilityJson(await this.submitCodeChange(args.chatId,submission));
+    }
+    throw Error("Unsupported native account operation.");
+  }
+
   async getMetadata(): Promise<GadgetMetadata> {
     let result: GadgetMetadata = {
       id: this.impl.ctx.id.toString(),
@@ -13168,6 +13340,27 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   // --- Allowed methods ---
 
+  async dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    requireCapabilityJson(input);
+    if (!input || Array.isArray(input) || typeof input !== "object") throw Error("Native operation requires an object.");
+    const gadgetId = input.gadgetId;
+    if (gadgetId !== undefined) {
+      if (typeof gadgetId !== "number" || !Number.isSafeInteger(gadgetId) || gadgetId < 0) throw Error("Invalid gadget ID.");
+      const record = this.impl.getGadgetRecord(gadgetId);
+      assertGadgetAccess(record.accessKeyHash, undefined);
+      if (record.pending) throw Error("Unaccepted gadget is unavailable.");
+      this.impl.assertGadgetUseWithoutCommands(gadgetId);
+    }
+    if (operation === "_authorize") return {owner:{userDurableObjectId:this.impl.ownerId!,profileId:this.impl.ownerProfileId!},role:"use"};
+    if (operation === "legion_workspace_get") {
+      const meta=await this.getMetadata();return {id:meta.id,title:meta.title,role:"use"};
+    }
+    if (operation === "legion_gadget_list") return takeCapabilityJson({gadgets:[...this.impl.storage.gadgets.list()]
+      .filter(record=>record.type === "gadget" && !record.pending)
+      .map(record=>({id:record.id,title:record.title,...("commitId" in record && record.commitId ? {commitId:record.commitId}:{})}))});
+    this.#deny();
+  }
+
   async getMetadata(): Promise<GadgetMetadata> {
     return {
       id: this.impl.ctx.id.toString(),
@@ -13420,6 +13613,12 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace';
   }
 
+  async dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId);
+  }
+  async queryCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    return this.impl.queryGadgetCapability(this.id, spec, request, this.clientUserId);
+  }
   async getCapabilityExports():Promise<GadgetCapabilityExports>{return this.impl.getCapabilityExports(this.id);}
 
   async executeCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
@@ -13730,6 +13929,10 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async getAccessMode(): Promise<'workspace' | 'key'> { this.#authorize(); return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace'; }
   async setAccess(_configuration: GadgetAccessConfiguration): Promise<void> { this.#deny(); }
+  async dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    this.#authorize(); return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId, this.admittedHash);
+  }
+  async queryCapability(_spec: GadgetCapabilitySpec, _request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> { this.#deny(); }
   async getCapabilityExports():Promise<GadgetCapabilityExports>{this.#deny();}
   async bindCapability(_name:string,_target:WorkpieceId,_spec:GadgetCapabilitySpec,_chatId?:number):Promise<void>{this.#deny();}
   async executeCapability(_spec: GadgetCapabilitySpec, _request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> { this.#deny(); }
@@ -14101,4 +14304,12 @@ class AgentSpawnerBindingImpl extends RpcTarget {
     return this.#getOverseer().spawnCallableAgent(
         title, options, this.ctx.props.config, this.ctx.props.creatorUserId);
   }
+}
+
+/** Native-only request capability, deliberately not a browser-supplied identity record. */
+@validateRpc()
+class GadgetRequestGuard extends NativeRpcTarget {
+  constructor(private resolveIdentity: () => Promise<GadgetRequestIdentity>) { super(); }
+  async current(): Promise<GadgetRequestIdentity> { return this.resolveIdentity(); }
+  async authorize(): Promise<void> { await this.resolveIdentity(); }
 }

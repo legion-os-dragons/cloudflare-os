@@ -6,6 +6,7 @@ import type { ProductAnalyticsRecord } from "./analytics";
 declare global {
   namespace Cloudflare {
     interface Env {
+      NATIVE_WORKSPACE_AUTHORITY_VENDORS?: string;
       // Deployment-wide admin usernames: a JSON binding, or the same array as a JSON string
       // (which is what a secret binding, can carry).
       ADMINS?: string[] | string;

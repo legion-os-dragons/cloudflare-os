@@ -1567,9 +1567,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
    * fresh by the caller so admin-gated features reflect the user's current status.
    */
+  async requireNativeAuthorityAccount(accountId: number, vendorId: string): Promise<void> {
+    const record = this.storage.connectedAccounts.get(accountId);
+    const allowed = (this.env.NATIVE_WORKSPACE_AUTHORITY_VENDORS ?? "").split(",").map(value => value.trim());
+    const config = await readAdminConfig(this.env);
+    if (!record || record.vendorId !== vendorId || !record.description.providesNativeWorkspaceAuthority ||
+        !allowed.includes(vendorId) || config.disabledGatekeepers.includes(vendorId) ||
+        (record.autoProvisioned && ambientGatekeeperMode(config,vendorId) === "disabled"))
+      throw Error("Native account delegation is unavailable or revoked.");
+  }
+
   async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) throw new Error("No such app.");
+    const allowed = (this.env.NATIVE_WORKSPACE_AUTHORITY_VENDORS ?? "").split(",").map(value => value.trim());
+    if (!record.description.providesNativeWorkspaceAuthority || !allowed.includes(record.vendorId))
+      context = {isAdmin:context.isAdmin};
     return (record.account as unknown as SingletonAccountStub).startAppUi(context);
   }
 

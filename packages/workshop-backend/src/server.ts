@@ -1,3 +1,7 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+import type { NativeAccountAuthority } from "@gadgets/workshop-shared/native-workspace-authority";
+import { takeCapabilityJson } from "./gadget-capabilities";
+import type { GadgetCapabilityJson } from "@gadgets/workshop-shared/gadget-capabilities";
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
@@ -620,7 +624,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let app = accounts.find((account: (typeof accounts)[number]) => account.vendorId === id && account.description.providesUi);
     if (!app) return null;
     // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
-    return user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+    const allowed = (this.env.NATIVE_WORKSPACE_AUTHORITY_VENDORS ?? "").split(",").map(value => value.trim());
+    const nativeWorkspaceAuthority = app.description.providesNativeWorkspaceAuthority && allowed.includes(app.vendorId)
+      ? this.ctx.exports.AccountWorkspaceAuthority({props:{
+        userName:this.#userId.name!,userId:this.#userId.toString(),accountId:app.accountId,vendorId:app.vendorId,
+      }}) as unknown as NativeAccountAuthority : undefined;
+    return user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin(), nativeWorkspaceAuthority });
+  }
+
+  nativeAccountIdentity(): { userDurableObjectId: string; profileId: string } {
+    return {userDurableObjectId:this.#userId.toString(),profileId:this.#userId.name!};
   }
 
   // --- Deployment admin ---
@@ -984,4 +997,29 @@ function newWorkersWebSocketRpcResponse(
     status: 101,
     webSocket: pair[1],
   });
+}
+
+/** Restorable native entrypoint; props are minted only by authenticated Workshop code. */
+@validateRpc()
+export class AccountWorkspaceAuthority extends WorkerEntrypoint<Env, {
+  userName:string;userId:string;accountId:number;vendorId:string;
+}> {
+  async #api(): Promise<AuthenticatedApiImpl> {
+    const props = this.ctx.props;
+    const userId = this.ctx.exports.UserDurableObject.idFromName(props.userName);
+    if (userId.toString() !== props.userId) throw Error("Native account identity mismatch.");
+    await this.ctx.exports.UserDurableObject.get(userId).requireNativeAuthorityAccount(props.accountId, props.vendorId);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, reason => {throw reason;});
+  }
+  async identity(): Promise<{userDurableObjectId:string;profileId:string}> {
+    const api = await this.#api();
+    await api.whoami();
+    return api.nativeAccountIdentity();
+  }
+  async execute(workspaceId: string, operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
+    const api = await this.#api();
+    const workspace = await api.openGadget(workspaceId);
+    try { return takeCapabilityJson(await workspace.dispatchNativeAccountOperation(operation, input)); }
+    finally { workspace[Symbol.dispose](); }
+  }
 }

@@ -1,3 +1,4 @@
+import type { GadgetCapabilityJson, GadgetCapabilitySpec } from "./gadget-capabilities";
 // This file defines the API spoken between the Gadgets Workshop service and the front-end UI.
 //
 // The UI is a good old "fat client" SPA. Why not use SSR? Because:
@@ -238,7 +239,7 @@ const RESERVED_WORDS = new Set([
  * generated names), not enforced here.
  */
 export function validateBindingName(name: string): void {
-  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN)
+  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === "GADGET_REQUEST")
     throw Error("This binding name is reserved for the native gadget command bridge.");
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
@@ -1920,6 +1921,8 @@ export type AgentSpawnerConfig = {
  * createGadget()/getGadget()).
  */
 export interface Overseer extends RpcTarget {
+  /** Trusted fixed account delegation operations; no raw RPC method forwarding. */
+  dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
   /** Get metadata describing this workspace. */
   getMetadata(): Promise<GadgetMetadata>;
 
@@ -4508,6 +4511,11 @@ export type GadgetAccessConfiguration =
  * sharing, actions, blueprint listing) stay on Overseer; this covers the per-gadget surface.
  */
 export interface GadgetClient extends WorkpieceClient {
+  /** Invoke the fixed authored handleRequest(JSON) entry with native request-local identity. */
+  dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
+  /** Read a declared producer projection without installing a consumer connection. Build-only. */
+  queryCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
+
   /** List the producer's explicitly exported projection/command ports. */
   getCapabilityExports():Promise<import('./gadget-capabilities').GadgetCapabilityExports>;
 

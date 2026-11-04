@@ -42,6 +42,10 @@
     "./gadget-capabilities-server": {
       "types": "./src/gadget-capabilities-server.ts",
       "import": "./src/gadget-capabilities-server.ts"
+    },
+    "./native-workspace-authority": {
+      "types": "./src/native-workspace-authority.ts",
+      "import": "./src/native-workspace-authority.ts"
     }
   },
   "scripts": {

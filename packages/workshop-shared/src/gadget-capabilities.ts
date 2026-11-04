@@ -82,3 +82,19 @@ export interface GadgetCommandFacet extends RpcTarget {
   /** Invoke only this named command port, under the kernel-derived grant context. */
   execute(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
 }
+
+/** Trusted native per-dispatch identity; no deployment tenant is inferred here. */
+export interface GadgetRequestIdentity {
+  actorId: string;
+  profileId: string;
+  displayName: string;
+  workspaceId: string;
+  gadgetId: number;
+  role: "build" | "use";
+  requestId: string;
+}
+/** Available only while a native dispatchRequest invocation is active. */
+export interface GadgetRequestContext {
+  current(): Promise<GadgetRequestIdentity>;
+  authorize(): Promise<void>;
+}

@@ -481,10 +481,22 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
-              if (property === 'nativeClipboardWrite') return async (text: string) => {
+              if (property === 'nativeClipboardWrite') return async (content: string | { mimeType: 'image/png'; base64: string }) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                if (typeof text !== 'string') throw new Error('Clipboard content must be text.')
-                await navigator.clipboard.writeText(text)
+                if (typeof content === 'string') {
+                  await navigator.clipboard.writeText(content)
+                } else {
+                  if (!content || content.mimeType !== 'image/png' || typeof content.base64 !== 'string' ||
+                    content.base64.length > 16 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content.base64)) {
+                    throw new Error('Clipboard images must be PNG files up to 12 MiB.')
+                  }
+                  const bytes = Uint8Array.from(atob(content.base64), character => character.charCodeAt(0))
+                  const signature = [137, 80, 78, 71, 13, 10, 26, 10]
+                  if (bytes.length < signature.length || signature.some((byte, index) => bytes[index] !== byte)) {
+                    throw new Error('Clipboard image is not a PNG file.')
+                  }
+                  await navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob([bytes], { type: 'image/png' }) })])
+                }
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
               }
               if (property === 'nativeSignOut') return async () => {

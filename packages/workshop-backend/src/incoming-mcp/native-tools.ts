@@ -3,7 +3,7 @@ import type { AuthenticatedApi, WorkpieceSummary, WorkpiecesSubscriber } from "@
 import type { LegionToolInputs, LegionToolName, LegionToolOutputs } from "./types.js";
 import type { McpToolRuntime } from "./runtime.js";
 import { McpPublicError } from "./runtime.js";
-import { assertJson, LimitError } from "./validation.js";
+import { assertJson, LimitError, RESPONSE_JSON_LIMITS } from "./validation.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { takeCapabilityJson, takeCapabilityExports, disposeCapabilityResult } from "../gadget-capabilities.js";
 class Workpieces extends RpcTarget implements WorkpiecesSubscriber {
@@ -83,7 +83,7 @@ export class NativeMcpTools implements McpToolRuntime {
       // applying a producer payload limit to the larger MCP envelope.
       try {
         const detached: unknown = JSON.parse(JSON.stringify(result));
-        assertJson(detached);
+        assertJson(detached, RESPONSE_JSON_LIMITS);
         return detached as LegionToolOutputs[N];
       } finally { disposeCapabilityResult(result); }
     }catch(error){

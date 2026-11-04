@@ -10,6 +10,9 @@ export const LIMITS = Object.freeze({
   timeoutMilliseconds: 30_000,
 });
 
+/** Native producer JSON permits depth 64 and 100,000 nodes; reserve only envelope overhead. */
+export const RESPONSE_JSON_LIMITS = Object.freeze({ jsonDepth: 68, jsonNodes: 100_032 });
+
 export class InputError extends Error {}
 export class LimitError extends Error {}
 
@@ -42,11 +45,11 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Validate values before dispatch and before delivery. Never invokes getters or toJSON. */
-export function assertJson(value: unknown): asserts value is LegionJson {
+export function assertJson(value: unknown, limits: { jsonDepth: number; jsonNodes: number } = LIMITS): asserts value is LegionJson {
   let nodes = 0;
   const active = new Set<object>();
   function visit(current: unknown, depth: number): void {
-    if (++nodes > LIMITS.jsonNodes || depth > LIMITS.jsonDepth) throw new LimitError("JSON structure exceeds the supported limit.");
+    if (++nodes > limits.jsonNodes || depth > limits.jsonDepth) throw new LimitError("JSON structure exceeds the supported limit.");
     if (current === null || typeof current === "string" || typeof current === "boolean") return;
     if (typeof current === "number" && Number.isFinite(current)) return;
     if (typeof current !== "object" || current === null) throw new InputError("Only finite JSON values are supported.");

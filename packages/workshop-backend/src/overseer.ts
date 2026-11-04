@@ -1,4 +1,5 @@
 import {prepareCodeChangeStorage} from './code-change-storage';
+import {readCompiledModules} from './compiled-modules';
 import type {GadgetAlarmScheduler,GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
 import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
 import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
@@ -5494,6 +5495,12 @@ class OverseerImpl implements AgentHooks {
             wasm: Uint8Array.fromBase64(content),
           };
         }
+      }
+
+      const compiledModules=await readCompiledModules(files);
+      for(const [name,module] of Object.entries(compiledModules)){
+        if(Object.hasOwn(modules,name))throw Error('Compiled module conflicts with an authored worker module.');
+        modules[name]=module;
       }
 
       let tailProps: GadgetTailLoopbackProps = {

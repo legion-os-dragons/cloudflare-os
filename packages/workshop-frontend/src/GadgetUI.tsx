@@ -9,6 +9,7 @@ import { GadgetDeviceState, type DeviceStateScope } from './features/gadgets/dev
 import { GadgetFileActions } from './features/gadgets/fileActions'
 import { GadgetAccessSession } from './features/gadgets/accessSession'
 import { isTransientRpcError } from './rpcErrors'
+import { useAuthenticatedApi } from './AuthContext'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -54,8 +55,14 @@ for (let level of ['debug', 'info', 'log', 'warn', 'error']) {
   };
 }
 
-// Allow user-activated target=_blank links, but block programmatic popups.
-const blockedOpen = () => {
+// A user-activated blank window lets an admitted app initialize its own preview.
+// Remote programmatic navigation stays blocked; links keep their existing path.
+const openBlank = window.open.bind(window);
+const blockedOpen = (url, target, features) => {
+  if (url === 'about:blank' && (target === '_blank' || target === undefined)
+      && navigator.userActivation.isActive) {
+    return openBlank('about:blank', '_blank', features);
+  }
   console.error('window.open() is disabled in Gadget UIs. Use a link with target="_blank" instead.');
   return null;
 };
@@ -154,6 +161,9 @@ export default function GadgetUI(props: GadgetUIProps) {
 }
 
 function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections, onRetryConnection }: GadgetUIProps) {
+  const { logout } = useAuthenticatedApi()
+  const logoutRef = useRef(logout)
+  logoutRef.current = logout
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -471,6 +481,10 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
           }
           const forwardingTarget = new Proxy(new RpcTarget() as any, {
             get: (target, property, receiver) => {
+              if (property === 'nativeSignOut') return async () => {
+                if (!isCurrent()) throw new Error('Gadget session has ended.')
+                logoutRef.current()
+              }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 const result = await gadgetRef.current.dispatchRequest(request)

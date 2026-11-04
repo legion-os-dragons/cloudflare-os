@@ -48,8 +48,8 @@ const downloadMimeTypes = new Set([
   'image/tiff', 'image/x-icon', 'image/vnd.microsoft.icon',
 ])
 function validateDownload(request: DownloadRequest): void {
-  if (!request || typeof request.filename !== 'string' || request.filename.length < 1 || request.filename.length > 1024 || /[/\\]/.test(request.filename) || /[\u0000-\u001f\u007f]/.test(request.filename) || request.filename === '.' || request.filename === '..') throw Error('The download filename is invalid.')
-  if (typeof request.mediaType !== 'string' || request.mediaType.length > 240 || /[\u0000-\u001f\u007f]/.test(request.mediaType)) throw Error('The download media type is invalid.')
+  if (!request || typeof request.filename !== 'string' || request.filename.length < 1 || request.filename.length > 1024 || /[/\\]/.test(request.filename) || Array.from(request.filename).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127) || request.filename === '.' || request.filename === '..') throw Error('The download filename is invalid.')
+  if (typeof request.mediaType !== 'string' || request.mediaType.length > 240 || Array.from(request.mediaType).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) throw Error('The download media type is invalid.')
   const base = request.mediaType.split(';')[0].trim().toLowerCase()
   if (!downloadMimeTypes.has(base) && !/^(?:audio|video)\/[a-z0-9.+-]+$/.test(base)) throw Error('The download media type is not supported.')
   if (!Number.isSafeInteger(request.byteLength) || request.byteLength < 0 || request.byteLength > MAX_DOWNLOAD_BYTES) throw Error('The download exceeds its one-GiB size limit.')

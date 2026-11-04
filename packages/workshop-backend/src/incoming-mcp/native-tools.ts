@@ -17,7 +17,7 @@ class Workpieces extends RpcTarget implements WorkpiecesSubscriber {
 async function listGadgets(workspace: Awaited<ReturnType<AuthenticatedApi["openGadget"]>>) {
   const receiver = new Workpieces();
   using callback = new RpcStub<WorkpiecesSubscriber>(receiver);
-  using subscription = await workspace.subscribeToWorkpieces(callback);
+  using _subscription = await workspace.subscribeToWorkpieces(callback);
   await receiver.completed;
   return [...receiver.rows.values()].filter(row => row.type === "gadget").map(row => ({id:row.id,title:row.title,...(row.commitId?{commitId:row.commitId}:{})}));
 }

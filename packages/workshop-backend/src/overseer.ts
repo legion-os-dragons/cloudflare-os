@@ -2783,15 +2783,15 @@ class OverseerImpl implements AgentHooks {
     if(record?.creationSpec?.type!=='agentSpawner'||record.creationSpec.config.modelId!==null||Object.keys(record.creationSpec.config.env).length)return false;
     try{this.assertGatekeeperUsable(record.id);return true}catch{return false}
   }
-  async resolveEmbeddedIdentity(gadgetId:number,userId:string,revision:number):Promise<GadgetRequestIdentity>{
+  async resolveEmbeddedIdentity(gadgetId:number,userId:string,revision:number,admittedHash?:string):Promise<GadgetRequestIdentity>{
     if(!this.embeddedAgentEnabled(gadgetId))throw Error('The embedded assistant connection is unavailable.');
-    const identity=await this.resolveGadgetIdentity(gadgetId,userId,revision,crypto.randomUUID());
+    const identity=await this.resolveGadgetIdentity(gadgetId,userId,revision,crypto.randomUUID(),undefined,admittedHash);
     if(!this.embeddedAgentEnabled(gadgetId))throw Error('The embedded assistant connection changed.');
     return identity;
   }
-  embeddedGuard(gadgetId:number,userId:string,revision:number):NativeChatGuard{
+  embeddedGuard(gadgetId:number,userId:string,revision:number,admittedHash?:string):NativeChatGuard{
     const requestId=crypto.randomUUID();
-    return new GadgetRequestGuard(async()=>({...await this.resolveEmbeddedIdentity(gadgetId,userId,revision),requestId}),this.getOrCreateGadgetBridgeToken(gadgetId));
+    return new GadgetRequestGuard(async()=>({...await this.resolveEmbeddedIdentity(gadgetId,userId,revision,admittedHash),requestId}),this.getOrCreateGadgetBridgeToken(gadgetId));
   }
   getEmbeddedModelCapabilities(config:AiModelConfig,profile:AiChatAuthorInfo):Pick<ReturnType<typeof getModel>['model'],'reasoning'|'api'>{const {reasoning,api}=getModel(this.env,config,profile).model;return {reasoning,api}}
   getEmbeddedUserModels(actorId:string):ReturnType<UserDurableObject['listModels']>{return this.users.get(this.users.idFromString(actorId)).listModels()}
@@ -2807,7 +2807,7 @@ class OverseerImpl implements AgentHooks {
     const requestId = crypto.randomUUID();
     let active = true;
     const resolveIdentity=async():Promise<GadgetRequestIdentity>=>{if(!active)throw Error('No active native gadget request.');const identity=await this.resolveGadgetIdentity(gadgetId,userId,revision,requestId,chatId,admittedHash);if(!active)throw Error('The native request has ended.');return identity;};
-    const guard = new GadgetRequestGuard(resolveIdentity,this.getOrCreateGadgetBridgeToken(gadgetId),this.embeddedAgents.host(resolveIdentity));
+    const guard = new GadgetRequestGuard(resolveIdentity,this.getOrCreateGadgetBridgeToken(gadgetId),this.embeddedAgents.host(resolveIdentity,admittedHash));
     let source: Fetcher<DurableObject> | undefined;
     try {
       const identity = await resolveIdentity();

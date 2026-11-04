@@ -22,6 +22,8 @@ export interface EmbeddedChatState {
   revision: number;
   scope: NativeChatScope;
   rawTargetSequence: number;
+  /** Existing native key-admission fingerprint; never supplied by application or model JSON. */
+  admittedHash?: string;
   system?: string;
   thinking?: { enabled: boolean };
   modelId?: string;
@@ -76,7 +78,12 @@ export class EmbeddedChatBroker {
   async #authorize(id: number): Promise<GadgetRequestIdentity> {
     const state = this.#state(id);
     this.#enabled(state.gadgetId);
-    return this.impl.resolveEmbeddedIdentity(state.gadgetId, state.actorId, state.revision);
+    return this.impl.resolveEmbeddedIdentity(
+      state.gadgetId,
+      state.actorId,
+      state.revision,
+      state.admittedHash,
+    );
   }
   async #owned(id: number, identity: GadgetRequestIdentity): Promise<EmbeddedChatState> {
     const state = this.#state(id);
@@ -85,7 +92,7 @@ export class EmbeddedChatBroker {
     await this.#authorize(id);
     return state;
   }
-  host(resolve: () => Promise<GadgetRequestIdentity>): NativeChatHost {
+  host(resolve: () => Promise<GadgetRequestIdentity>, admittedHash?: string): NativeChatHost {
     const caller = async () => {
       const identity = await resolve();
       this.#enabled(identity.gadgetId);
@@ -175,6 +182,7 @@ export class EmbeddedChatBroker {
             revision: this.impl.getGadgetRecord(identity.gadgetId).accessRevision ?? 0,
             scope,
             rawTargetSequence: raw,
+            ...(admittedHash ? { admittedHash } : {}),
           },
         });
         this.impl.storage.agentCallbackArgs.put({ chatId: id, sequence: raw, args: [target] });
@@ -340,7 +348,12 @@ export class EmbeddedChatBroker {
   async call(chatId: number, method: string, params: unknown) {
     if (!SYSCALLS.has(method)) throw Error("The embedded agent cannot invoke that syscall.");
     const state = this.#state(chatId),
-      guard = this.impl.embeddedGuard(state.gadgetId, state.actorId, state.revision);
+      guard = this.impl.embeddedGuard(
+        state.gadgetId,
+        state.actorId,
+        state.revision,
+        state.admittedHash,
+      );
     await guard.authorize();
     const record = this.impl.storage.agentCallbackArgs.get(key(chatId, state.rawTargetSequence)),
       target = record?.args[0] as NativeChatTarget | undefined;

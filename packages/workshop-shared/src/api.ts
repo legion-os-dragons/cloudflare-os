@@ -239,7 +239,7 @@ const RESERVED_WORDS = new Set([
  * generated names), not enforced here.
  */
 export function validateBindingName(name: string): void {
-  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN || name === "GADGET_REQUEST")
+  if (name === GADGET_CAPABILITY_BRIDGE_TOKEN || (name === "GADGET_REQUEST" || name === "GADGET_AGENT"))
     throw Error("This binding name is reserved for the native gadget command bridge.");
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
@@ -1921,8 +1921,8 @@ export type AgentSpawnerConfig = {
  * createGadget()/getGadget()).
  */
 export interface Overseer extends RpcTarget {
-  /** Trusted fixed account delegation operations; no raw RPC method forwarding. */
-  dispatchNativeAccountOperation(operation: string, input: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
+  /** Read a consistent native draft position and selected files for an existing chat and gadget. Build-only; retries if code changes during the read. */
+  readChatCodeSnapshot(chatId: number, gadgetId: WorkpieceId, paths: string[]): Promise<{codeBase: ChatCodeBase; files: [string, FileAtCommit][]; unansweredPaths: string[]}>;
   /** Get metadata describing this workspace. */
   getMetadata(): Promise<GadgetMetadata>;
 

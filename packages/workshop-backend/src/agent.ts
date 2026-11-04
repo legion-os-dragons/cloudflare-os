@@ -1,3 +1,4 @@
+import type {EmbeddedChatState} from './embedded-agent';
 import {prepareCodeChangeStorage} from './code-change-storage';
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, composeCodeChange, validateCodeChangeSchema, replaceSpanChange, type CodeContent,
@@ -163,6 +164,9 @@ export interface WorktreeTurnAccess {
 export type AiChatAgentContext = {
   /** Chat ID, corresponds to `chatMeta`. */
   chatId: number;
+
+  /** Caller-bound data assistant restrictions; no ambient, code or account authority. */
+  embedded?:EmbeddedChatState;
 
   /**
    * If present, this chat was spawned using a spawner, and this was the spawner config at the
@@ -2836,6 +2840,7 @@ async function runAgentPass(
     systemPromptSlots[0] += `\n\n${instanceInstructions}`;
   }
   let systemPrompt = `${systemPromptSlots[0]}\n\n${systemPromptSlots[1]}`;
+  if(agentContext.embedded)systemPrompt='You are an embedded application assistant. Your only capability is env.RENDERER[0].call(method,params) in executeCode. Allowed methods: legion_target_get_active, legion_target_surface_snapshot, legion_target_surface_capabilities_search, legion_target_surface_capability_describe, legion_target_surface_execute, legion_target_surface_execute_batch. Discover the original application capabilities before executing. You have no GIT, filesystem, workpieces, web, connections or other accounts.\n'+(agentContext.embedded.system??'');
 
   // Some models charge their response to the same window as the prompt, so the reservation is both
   // withheld from the prompt's budget and sent as the response cap -- the two can't disagree.
@@ -3691,7 +3696,7 @@ async function runAgentPass(
     // they get nothing that modifies gadgets or requests connections; they can inspect and call
     // bindings, fetch the web, and work on worktrees (writes to gadgets are refused by
     // assertMayModifyWorkpiece).
-    tools = Object.fromEntries(SPAWNED_AGENT_TOOLS.map(name => [name, tools[name]]));
+    tools = Object.fromEntries((agentContext.embedded?['executeCode']:SPAWNED_AGENT_TOOLS).map(name => [name, tools[name]]));
   }
 
   // Calls that reached a tool's execute(), so tool_execution_end can tell the ones pi rejected.
@@ -3970,7 +3975,7 @@ async function runAgentPass(
         return {action: "end"};
       }
     },
-  }, emit, abortSignal, handle.stream);
+  }, emit, abortSignal, agentContext.embedded?.thinking ? (model,context,options)=>handle.stream(model,context,{...options,thinking:agentContext.embedded!.thinking!.enabled}) : handle.stream);
 
   // (No end-of-turn flush: every completed step's effects were barrier-committed with its
   // message, and an abort simply drops the in-flight step's buffer -- nothing durable exists

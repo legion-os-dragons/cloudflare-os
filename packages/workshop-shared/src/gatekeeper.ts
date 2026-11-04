@@ -92,8 +92,6 @@ export type VendorDescription = {
  */
 export type AppUiContext = {
   isAdmin: boolean;
-  /** Supplied only to deployment-allowlisted, opted-in account Workers; never iframe UI. */
-  nativeWorkspaceAuthority?: import("./native-workspace-authority").NativeAccountAuthority;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -191,8 +189,6 @@ export type AccountDescription = {
    * surfaces it as a nav entry / page using this title.
    */
   providesUi?: { title: string; icon?: AvatarImage };
-  /** Explicit opt-in, additionally gated by the deployment native-authority allowlist. */
-  providesNativeWorkspaceAuthority?: boolean;
 }
 
 /** Describes metadata about a specific instance of a resource. Returned by Gatekeeper.describe(). */

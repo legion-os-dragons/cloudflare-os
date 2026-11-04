@@ -494,9 +494,21 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                const result = await gadgetRef.current.dispatchRequest(request, chatId)
+                if (pendingGadgetStubRef.current) await recoverStatusRead(gadgetStubRef.current)
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                return result
+                const client = gadgetRef.current
+                const failedStub = gadgetStubRef.current
+                try {
+                  const result = await client.dispatchRequest(request, chatId)
+                  if (!isCurrent()) throw new Error('Gadget session has ended.')
+                  return result
+                } catch (caught) {
+                  if (isCurrent() && gadgetRef.current === client && isTransientRpcError(caught)) {
+                    // Reopen for the next call; never replay an uncertain write.
+                    void recoverStatusRead(failedStub).catch(() => {})
+                  }
+                  throw caught
+                }
               }
               if (property === 'workshopDeviceState') return deviceState
               if (property === 'workshopFileActions') return fileActions

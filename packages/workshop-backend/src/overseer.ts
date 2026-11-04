@@ -470,6 +470,11 @@ export type WorktreeRecord = {
  */
 export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
+/** The native published-workpiece boundary shared by use-role discovery paths. */
+function isPublishedWorkpiece(record: WorkpieceRecord, includePending: boolean): boolean {
+  return includePending || (record.type === "gadget" && !record.pending && !record.accessKeyHash);
+}
+
 function unlockedGadgetTitle(record:WorkpieceRecord|undefined):string|undefined{
   return record?.type==='gadget'&&!record.accessKeyHash?record.title:undefined;
 }
@@ -2743,8 +2748,9 @@ class OverseerImpl implements AgentHooks {
   }
 
   async dispatchGadgetRequest(gadgetId: WorkpieceId, request: GadgetCapabilityJson,
-      userId: string, admittedHash?: string): Promise<GadgetCapabilityJson> {
+      userId: string, chatId?: number, admittedHash?: string): Promise<GadgetCapabilityJson> {
     requireCapabilityJson(request);
+    if (chatId !== undefined && (!Number.isSafeInteger(chatId) || chatId < 0)) throw Error("Invalid chat ID.");
     const revision = this.getGadgetRecord(gadgetId).accessRevision ?? 0;
     const requestId = crypto.randomUUID();
     let active = true;
@@ -2759,6 +2765,11 @@ class OverseerImpl implements AgentHooks {
       if (!active || currentRole !== role) throw Error("Workspace authority changed during request.");
       const record = this.getGadgetRecord(gadgetId);
       if ((record.accessRevision ?? 0) !== revision) throw Error("Gadget request revoked.");
+      if (chatId !== undefined) {
+        if (role !== "build") throw Error("Chat previews require current build access.");
+        this.getChatMetaOrThrow(chatId);
+      }
+      if (record.pending && record.pending.chatId !== chatId) throw Error("This gadget is not available in the selected chat.");
       if (role === "use") {
         assertGadgetAccess(record.accessKeyHash, admittedHash);
         this.assertGadgetUseWithoutCommands(gadgetId);
@@ -2772,7 +2783,7 @@ class OverseerImpl implements AgentHooks {
     try {
       const identity = await resolveIdentity();
       using _session = {[Symbol.dispose]: this.joinSession(userId === this.ownerId ? "owner" : identity.role)};
-      source = await this.getGadgetFacetFetcher(gadgetId);
+      source = await this.getGadgetFacetFetcher(gadgetId, chatId);
       await resolveIdentity();
       const token = this.storage.gadgetCapabilityBridgeTokens.get()[gadgetId];
       const result = takeCapabilityJson(await (source as any).__dispatchKernelRequest(token, guard, request));
@@ -3272,8 +3283,7 @@ class OverseerImpl implements AgentHooks {
     };
 
     // Whether the record is published to this subscriber (see above for what is withheld).
-    let published = (record: WorkpieceRecord): boolean =>
-        includePending || (record.type === "gadget" && !record.pending && !record.accessKeyHash);
+    let published = (record: WorkpieceRecord): boolean => isPublishedWorkpiece(record, includePending);
 
     let dbSubscriber = {
       add(record: WorkpieceRecord) {
@@ -13363,7 +13373,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       const meta=await this.getMetadata();return {id:meta.id,title:meta.title,role:"use"};
     }
     if (operation === "legion_gadget_list") return takeCapabilityJson({gadgets:[...this.impl.storage.gadgets.list()]
-      .filter(record=>record.type === "gadget" && !record.pending)
+      .filter(record=>isPublishedWorkpiece(record, false))
       .map(record=>({id:record.id,title:record.title,...("commitId" in record && record.commitId ? {commitId:record.commitId}:{})}))});
     this.#deny();
   }
@@ -13620,8 +13630,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace';
   }
 
-  async dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
-    return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId);
+  async dispatchRequest(request: GadgetCapabilityJson, chatId?: number): Promise<GadgetCapabilityJson> {
+    return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId, chatId);
   }
   async queryCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
     return this.impl.queryGadgetCapability(this.id, spec, request, this.clientUserId);
@@ -13936,8 +13946,9 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   async getAccessMode(): Promise<'workspace' | 'key'> { this.#authorize(); return this.impl.getGadgetRecord(this.id).accessKeyHash ? 'key' : 'workspace'; }
   async setAccess(_configuration: GadgetAccessConfiguration): Promise<void> { this.#deny(); }
-  async dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> {
-    this.#authorize(); return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId, this.admittedHash);
+  async dispatchRequest(request: GadgetCapabilityJson, chatId?: number): Promise<GadgetCapabilityJson> {
+    if (chatId !== undefined) this.#deny();
+    this.#authorize(); return this.impl.dispatchGadgetRequest(this.id, request, this.clientUserId, undefined, this.admittedHash);
   }
   async queryCapability(_spec: GadgetCapabilitySpec, _request: GadgetCapabilityJson): Promise<GadgetCapabilityJson> { this.#deny(); }
   async getCapabilityExports():Promise<GadgetCapabilityExports>{this.#deny();}

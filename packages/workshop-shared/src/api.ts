@@ -4511,8 +4511,8 @@ export type GadgetAccessConfiguration =
  * sharing, actions, blueprint listing) stay on Overseer; this covers the per-gadget surface.
  */
 export interface GadgetClient extends WorkpieceClient {
-  /** Invoke the fixed authored handleRequest(JSON) entry with native request-local identity. */
-  dispatchRequest(request: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
+  /** Invoke handleRequest(JSON) with native request-local identity. Build callers may select a live chat preview; use callers are mainline-only. */
+  dispatchRequest(request: GadgetCapabilityJson, chatId?: number): Promise<GadgetCapabilityJson>;
   /** Read a declared producer projection without installing a consumer connection. Build-only. */
   queryCapability(spec: GadgetCapabilitySpec, request: GadgetCapabilityJson): Promise<GadgetCapabilityJson>;
 

@@ -487,7 +487,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                const result = await gadgetRef.current.dispatchRequest(request)
+                const result = await gadgetRef.current.dispatchRequest(request, chatId)
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 return result
               }

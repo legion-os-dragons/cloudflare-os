@@ -3938,18 +3938,23 @@ class OverseerImpl implements AgentHooks {
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback(edge.capability?{type:'gadgetCapability',gadgetId,name,generation:edge.capability.generation,epoch:this.#connectionEpoch}:{type: "gatekeeper", id: edge.target}, caller);
     }
-    const tokens = this.storage.gadgetCapabilityBridgeTokens.get();
-    if (!tokens[gadgetId]) {
-      tokens[gadgetId] = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
-      this.storage.gadgetCapabilityBridgeTokens.put(tokens);
-    }
     // Last, so even legacy bindings cannot shadow the producer's native-only bridge key.
-    env[GADGET_CAPABILITY_BRIDGE_TOKEN] = tokens[gadgetId];
+    env[GADGET_CAPABILITY_BRIDGE_TOKEN] = this.getOrCreateGadgetBridgeToken(gadgetId);
     env[GADGET_ALARM_BINDING] = this.ctx.exports.GadgetAlarmLoopback({props: {
       overseerId: this.ctx.id.toString(), gadgetId, accessRevision: gadget.accessRevision ?? 0,
       ...(forChatId === undefined ? {} : {chatId: forChatId}),
     }});
     return env;
+  }
+
+  private getOrCreateGadgetBridgeToken(gadgetId: WorkpieceId): string {
+    this.getGadgetRecord(gadgetId);
+    const tokens = this.storage.gadgetCapabilityBridgeTokens.get();
+    if (!tokens[gadgetId]) {
+      tokens[gadgetId] = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
+      this.storage.gadgetCapabilityBridgeTokens.put(tokens);
+    }
+    return tokens[gadgetId];
   }
 
   // Build the agent's executeCode env from the chat's binding map: each name resolves to a
@@ -5581,6 +5586,9 @@ export class Gadget extends AuthoredGadget {
   async getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number)
       : Promise<Fetcher<DurableObject>> {
     const revision = this.getGadgetRecord(gadgetId).accessRevision;
+    // Persistent facets and WorkerLoader initialize lazily. Seal the bridge key before
+    // a caller reads it to construct the first request or alarm dispatch arguments.
+    this.getOrCreateGadgetBridgeToken(gadgetId);
     let params: OverseerRestoreParams = {type: "gadget", gadgetId, ...(revision ? {accessRevision: revision} : {})};
     chatId = this.#resolveGadgetChatId(gadgetId, chatId);
     if (chatId !== undefined) params.chatId = chatId;

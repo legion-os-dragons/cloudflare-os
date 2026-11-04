@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button } from '@cloudflare/kumo'
+import { Button, Dialog } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { AuthenticatedApi, Overseer, WorkpieceId } from '@gadgets/workshop-shared/api'
 
 export default function GadgetInstanceCreate({ api, overseer, onCreated }: { api: RpcStub<AuthenticatedApi>; overseer: RpcStub<Overseer>; onCreated(id: WorkpieceId): void }) {
   const [choices, setChoices] = useState<Array<{ id: string; title: string }>>([])
   const [blueprint, setBlueprint] = useState(''), [title, setTitle] = useState(''), [locked, setLocked] = useState(true), [key, setKey] = useState(''), [message, setMessage] = useState(''), [busy, setBusy] = useState(false)
+  const [open, setOpen] = useState(false)
   const generation = useRef(0)
   useEffect(() => { generation.current++; setChoices([]); setBlueprint(''); setKey(''); setMessage(''); setBusy(false); return () => { generation.current++ } }, [api, overseer])
   const load = async () => {
@@ -31,7 +32,12 @@ export default function GadgetInstanceCreate({ api, overseer, onCreated }: { api
     } catch (error) { if (own !== generation.current) return; setMessage(error instanceof Error ? error.message : 'The app instance could not be created.') }
     finally { client?.[Symbol.dispose](); if (own === generation.current) setBusy(false) }
   }
-  return <details className="relative" onToggle={event => { if (event.currentTarget.open) void load() }}><summary className="cursor-pointer text-xs">Add app here</summary><div className="absolute right-0 z-50 w-80 rounded border border-kumo-line bg-kumo-base p-4 shadow-lg">
+  return <>
+    <Button size="sm" variant="ghost" onClick={() => { setOpen(true); void load() }}>Add app here</Button>
+    <Dialog.Root open={open} onOpenChange={value => { if (!busy) setOpen(value) }}>
+      <Dialog size="sm" className="p-5">
+        <Dialog.Title>Add app to this workspace</Dialog.Title>
+        <Dialog.Description className="mb-4 text-xs text-kumo-subtle">Create an independent instance from your app library.</Dialog.Description>
     <label className="block text-xs">Reusable app<select aria-label="Reusable app" className="my-1 block w-full border border-kumo-line p-2" value={blueprint} onChange={event => setBlueprint(event.target.value)}><option value="">Choose from library</option>{choices.map(choice => <option key={choice.id} value={choice.id}>{choice.title}</option>)}</select></label>
     <label className="block text-xs">Instance name<input aria-label="App instance name" className="my-1 block w-full border border-kumo-line p-2" value={title} onChange={event => setTitle(event.target.value)} /></label>
     <label className="my-2 flex gap-2 text-xs"><input type="checkbox" checked={locked} onChange={event => setLocked(event.target.checked)} />Require a key for workspace users</label>
@@ -39,5 +45,8 @@ export default function GadgetInstanceCreate({ api, overseer, onCreated }: { api
     <Button disabled={busy} onClick={() => { void create() }}>Create app instance</Button>
     {key && <label className="mt-2 block text-xs">New gadget key<input aria-label="Created gadget key" readOnly value={key} className="mt-1 w-full border border-kumo-line p-2" onFocus={event => event.currentTarget.select()} /></label>}
     {message && <p role="status" className="mt-2 text-xs">{message}</p>}
-  </div></details>
+        <div className="mt-4"><Button variant="secondary" disabled={busy} onClick={() => setOpen(false)}>Close</Button></div>
+      </Dialog>
+    </Dialog.Root>
+  </>
 }

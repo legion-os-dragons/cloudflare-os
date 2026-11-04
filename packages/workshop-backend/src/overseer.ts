@@ -1,3 +1,4 @@
+import {prepareCodeChangeStorage} from './code-change-storage';
 import type {GadgetAlarmScheduler,GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
 import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
 import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
@@ -37,7 +38,7 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
+import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, STEP_CHANGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
@@ -4041,6 +4042,9 @@ class OverseerImpl implements AgentHooks {
     for (let row of rows) {
       change = change === undefined ? row.change : composeCodeChange(change, row.change);
     }
+
+    // Preserve the one-byte representation the agent preflight measured after composing rows.
+    if (change !== undefined) change = prepareCodeChangeStorage(change, STEP_CHANGE_BUDGET).change;
 
     let sequence = this.nextChatSequencePeek(chatId);
     this.addChatMessages(chatId, author!, [{

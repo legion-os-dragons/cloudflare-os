@@ -1,5 +1,6 @@
+import {prepareCodeChangeStorage} from './code-change-storage';
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
-import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
+import { applyCodeChange, composeCodeChange, validateCodeChangeSchema, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
@@ -47,24 +48,23 @@ const logger = createWorkshopLogger("workshop.agent");
  * oversized message, which storage already proved it can hold when the row itself was written.
  * Agent tool edits don't accumulate as live rows at all: they buffer in the step and land at
  * the barrier in one message, bounded by STEP_CHANGE_BUDGET at the write call. Measured with
- * codeChangeSerializedSize (composition never exceeds the sum of its inputs' sizes, so summing
- * rows bounds their composed change) and sized well clear of the 2MB storage record cap the
- * estimate upper-bounds against. (Declared here rather than in overseer.ts because agent.ts
+ * conservative storage bounds, checking both the summed rows and their composition. The
+ * budget leaves room for the surrounding message inside the 2MB storage record cap. (Declared here rather than in overseer.ts because agent.ts
  * must not import overseer.ts -- the dependency runs the other way.)
  */
 export const CHAT_CHANGE_MESSAGE_BUDGET = 1024 * 1024;
 
 /**
- * Byte bound on one agent step's buffered changes (their summed codeChangeSerializedSize),
+ * Byte bound on one agent step's buffered changes and their composition,
  * enforced at the write call: the file-tool call that would exceed it fails with an
  * agent-visible error, everything buffered before it persists normally at the barrier, and the
  * model adapts mid-turn. The bound exists for correctness -- the barrier writes the step's
  * buffer as *one* "changes" message, which must fit in a 2MB storage record, envelope included
  * -- with bounded buffer memory falling out as a side effect. Sized to admit any single valid
  * file write with margin: a maximal whole-file `set` (MAX_FILE_TEXT_LENGTH, 512K UTF-16 units)
- * measures at most ~1MB under the at-most-two-bytes-per-unit estimate. (Known, accepted gap:
- * createGadget's blueprint copy is a single multi-file change that may legally measure past
- * the budget, but no shipped blueprint comes close.)
+ * measures at most ~1MB under the at-most-two-bytes-per-unit estimate. Large JSON-only
+ * changes are normalized before measuring a tighter V8 storage bound; blueprint creation
+ * must pass the same budget before allocating a provisional gadget.
  */
 export const STEP_CHANGE_BUDGET = 1536 * 1024;
 
@@ -2550,7 +2550,7 @@ async function runAgentPass(
   // where needed (the barrier now; executeCodeMode once worktree writes join it). `bytes` is
   // the buffered changes' summed codeChangeSerializedSize, checked against STEP_CHANGE_BUDGET
   // at each write call.
-  let stepBuffer = {changes: [] as AgentStepChange[], bytes: 0};
+  let stepBuffer = {changes: [] as AgentStepChange[], bytes: 0, composed: undefined as CodeChange | undefined};
 
   // (A crashed predecessor leaves no stranded state to recover here: each step's rows, pins,
   // creation/binding stamps and messages are committed in one barrier transaction, so replay of
@@ -2592,6 +2592,21 @@ async function runAgentPass(
   // within the step, later tools read the edit through the session content. The first write to
   // an unpinned worktree pins it too, at its accepted commit, with nothing to declare (see
   // pinWorktreeInSession).
+  // Check before any registry allocation, and also before every ordinary edit. A later
+  // Unicode insertion can widen a whole composed set, so checking only summed row sizes
+  // would be insufficient even when each row fits on its own.
+  const assertStepChangeFits = (change: CodeChange) => {
+    const prepared = prepareCodeChangeStorage(change, STEP_CHANGE_BUDGET);
+    const combined = stepBuffer.composed === undefined ? prepared.change :
+        composeCodeChange(stepBuffer.composed, prepared.change);
+    const composed = prepareCodeChangeStorage(combined, STEP_CHANGE_BUDGET);
+    if (stepBuffer.bytes + prepared.bytes > STEP_CHANGE_BUDGET || composed.bytes > STEP_CHANGE_BUDGET) {
+      throw new Error("Too many code changes in one step. End this response; the changes made " +
+          "so far are being saved, and you can continue the work in your next step.");
+    }
+    return {...prepared, composed: composed.change};
+  };
+
   let appendAgentEdit = (
       workpieceId: WorkpieceId, change: CodeChange,
       pin?: {baseCommit: string, baseFiles: Map<string, string>}) => {
@@ -2599,11 +2614,9 @@ async function runAgentPass(
     // which must fit in one storage record. The failed call buffers nothing -- everything
     // buffered before it persists normally at the barrier -- and the error tells the model how
     // to adapt.
-    let size = codeChangeSerializedSize(change);
-    if (stepBuffer.bytes + size > STEP_CHANGE_BUDGET) {
-      throw new Error("Too many code changes in one step. End this response; the changes made " +
-          "so far are being saved, and you can continue the work in your next step.");
-    }
+    const prepared = assertStepChangeFits(change);
+    change = prepared.change;
+    const size = prepared.bytes;
     // Apply first: an inapplicable change must throw before anything buffers.
     let newContent = sessionContent;
     if (pin !== undefined) {
@@ -2616,6 +2629,7 @@ async function runAgentPass(
       ...(pin !== undefined ? {pin: {gadgetId: workpieceId, baseCommit: pin.baseCommit}} : {}),
     });
     stepBuffer.bytes += size;
+    stepBuffer.composed = prepared.composed;
     if (pin !== undefined) pinnedGadgets.add(workpieceId);
     sessionContent = newContent;
     pinWorktreeInSession(workpieceId);
@@ -3395,6 +3409,15 @@ async function runAgentPass(
           let blueprint = blueprintId !== undefined
               ? await hooks.fetchBlueprint(blueprintId) : undefined;
 
+          const fileChanges = Object.entries(blueprint?.files ?? {})
+              .map(([filename, text]): [string, {set: string}] => [filename, {set: text}]);
+          if (fileChanges.length > 0) {
+            // IDs are safe integers; the longest possible key bounds the eventual allocation.
+            const proposed = {[Number.MAX_SAFE_INTEGER]: fileChanges};
+            validateCodeChangeSchema(proposed);
+            assertStepChangeFits(proposed);
+          }
+
           // The gadget is created provisional to this chat: it becomes permanent only when the
           // user accepts the chat's changes. The registry record (and its name reservation) is
           // created immediately -- deferring it to the barrier would surface name conflicts
@@ -3426,8 +3449,6 @@ async function runAgentPass(
             // they ride the chat's proposed changes and revert together with the creation. The
             // new gadget is pending in this chat -- no head, hence no pin -- so its content
             // builds up from `set` changes.
-            let fileChanges = Object.entries(blueprint.files)
-                .map(([filename, text]): [string, {set: string}] => [filename, {set: text}]);
             if (fileChanges.length > 0) {
               appendAgentEdit(created.id, {[created.id]: fileChanges});
             }
@@ -3861,6 +3882,7 @@ async function runAgentPass(
         let stepChanges = stepBuffer.changes;
         stepBuffer.changes = [];
         stepBuffer.bytes = 0;
+        stepBuffer.composed = undefined;
         let createdGadgets = pendingCreatedGadgets;
         pendingCreatedGadgets = [];
         let createdWorktrees = pendingCreatedWorktrees;

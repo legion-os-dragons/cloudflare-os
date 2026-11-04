@@ -5521,11 +5521,11 @@ class OverseerImpl implements AgentHooks {
 
       return {
         // TODO: compatibility date configuration
-        compatibilityDate: "2026-09-04",
+        compatibilityDate: Object.keys(compiledModules).length ? "2026-09-04" : "2026-02-01",
         compatibilityFlags: [
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
-          "nodejs_compat",
+          Object.keys(compiledModules).length ? "nodejs_compat" : "nodejs_als",
         ],
         // alarm() is a native reserved RPC method. Invoke it locally through a sealed wrapper.
         mainModule: "__kernel_gadget_alarm.js",

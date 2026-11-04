@@ -9,7 +9,7 @@ import { GadgetDeviceState, type DeviceStateScope } from './features/gadgets/dev
 import { GadgetFileActions } from './features/gadgets/fileActions'
 import { GadgetAccessSession } from './features/gadgets/accessSession'
 import { isTransientRpcError } from './rpcErrors'
-import { useAuthenticatedApi } from './AuthContext'
+import { useOptionalAuthenticatedApi } from './AuthContext'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -161,9 +161,9 @@ export default function GadgetUI(props: GadgetUIProps) {
 }
 
 function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape, onNoUiChange, onOpenConnections, onRetryConnection }: GadgetUIProps) {
-  const { logout } = useAuthenticatedApi()
-  const logoutRef = useRef(logout)
-  logoutRef.current = logout
+  const auth = useOptionalAuthenticatedApi()
+  const logoutRef = useRef(auth?.logout)
+  logoutRef.current = auth?.logout
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -483,6 +483,7 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
             get: (target, property, receiver) => {
               if (property === 'nativeSignOut') return async () => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
+                if (!logoutRef.current) throw new Error('This view has no authenticated host session to sign out.')
                 logoutRef.current()
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {

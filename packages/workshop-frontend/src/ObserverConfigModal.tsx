@@ -286,7 +286,15 @@ export default function ObserverConfigModal({
     )
     return missingResourceUrlPatterns(account, required).length === 0
   }
-  const allSatisfied = needs.every(need => accountSatisfies(need, accountFor(need.gatekeeperId)))
+  const ownerOnly = (need: ObserverBindingNeed): boolean => {
+    const supported = vendorsById.get(need.vendorId)?.supportedResources
+      ?? accountFor(need.gatekeeperId)?.supportedResources
+    if (!supported || !need.resourceUrl) return false
+    const resource = resolveRequestedResource(supported, need.resourceUrl)
+    return resource.ok && resource.resource.observerAccess === 'owner-only'
+  }
+  const hasPrivateConnections = needs.some(ownerOnly)
+  const allSatisfied = needs.every(need => !ownerOnly(need) && accountSatisfies(need, accountFor(need.gatekeeperId)))
 
   // Share a UI choice only for the same resource, account and verification outcome.
   // The server still receives and verifies every original binding separately.
@@ -319,10 +327,12 @@ export default function ObserverConfigModal({
     <Dialog.Root open disablePointerDismissal onOpenChange={open => { if (!open) onCancel() }}>
       <Dialog className="responsive-dialog overflow-y-auto p-6" size="lg">
         <Dialog.Title className="mb-2 text-lg font-semibold">
-          {isRetry ? 'Review your connections' : 'Connect this workspace'}
+          {hasPrivateConnections ? 'This workspace has private connections' : isRetry ? 'Review your connections' : 'Connect this workspace'}
         </Dialog.Title>
         <Text variant="secondary" size="sm" as="p">
-          {isRetry
+          {hasPrivateConnections
+            ? 'Some services connected here do not support shared access. Their owner must provide a shareable view before you can open this workspace.'
+            : isRetry
             ? 'We couldn’t confirm your access to everything this workspace has read. Depending on ' +
               'the reason below, re-authenticate an expired account, choose a different one, or ask ' +
               'the workspace owner to share what your account can’t access.'
@@ -338,6 +348,7 @@ export default function ObserverConfigModal({
           <div className="flex flex-col gap-4 mt-5">
             {[...groups.values()].map(group => {
               const need = group[0]
+              const privateConnection = ownerOnly(need)
               const matching = [...accounts.values()].filter(a => a.vendorId === need.vendorId)
               const vendorInfo = vendorsById.get(need.vendorId)
               const vendor = matching[0]?.vendor ?? vendorInfo?.description
@@ -365,7 +376,7 @@ export default function ObserverConfigModal({
                         </div>
                       )}
                     </div>
-                    {matching.length === 0 && vendor && (
+                    {matching.length === 0 && vendor && !privateConnection && (
                       <WorkshopButton
                         tone="primary"
                         onClick={() => handleConnect(need)}
@@ -375,6 +386,14 @@ export default function ObserverConfigModal({
                       </WorkshopButton>
                     )}
                   </div>
+
+                  {privateConnection && (
+                    <p className="mt-3 text-sm text-kumo-subtle">
+                      This connection is private to the workspace owner. Connecting another account
+                      or entering a project key will not give you access. Ask the owner to share a
+                      view that does not include this private connection.
+                    </p>
+                  )}
 
                   {need.resourceUrl && (
                     <details className="mt-2 text-xs text-kumo-subtle">
@@ -398,7 +417,7 @@ export default function ObserverConfigModal({
                     </div>
                   )}
 
-                  {matching.length > 0 && (
+                  {matching.length > 0 && !privateConnection && (
                     <div className="flex flex-col gap-2">
                       {matching.length === 1 ? (
                         <div className="flex min-h-10 items-center gap-3 rounded-lg border border-kumo-line bg-kumo-elevated/50 px-3 py-2">
@@ -517,13 +536,13 @@ export default function ObserverConfigModal({
           <WorkshopButton tone="secondary" onClick={onCancel}>
             Cancel
           </WorkshopButton>
-          <WorkshopButton
+          {!hasPrivateConnections && <WorkshopButton
             tone="primary"
             onClick={handleConfirm}
             disabled={!ready || !vendorsReady || !allSatisfied}
           >
             {isRetry ? 'Verify again' : 'Verify and open'}
-          </WorkshopButton>
+          </WorkshopButton>}
         </div>
       </Dialog>
     </Dialog.Root>

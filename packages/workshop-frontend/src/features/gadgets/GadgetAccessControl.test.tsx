@@ -7,12 +7,11 @@ import { afterEach, expect, it, vi } from 'vitest'
 import GadgetAccessControl from './GadgetAccessControl'
 import GadgetKeyUnlock from './GadgetKeyUnlock'
 import GadgetInstanceCreate from './GadgetInstanceCreate'
-vi.mock('@cloudflare/kumo', () => ({ Button: (props: React.ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props} /> }))
 ;(globalThis as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT=true
 let root:Root|undefined, container:HTMLDivElement
 async function render(node:React.ReactNode){ container=document.createElement('div');document.body.append(container);root=createRoot(container);await act(async()=>{root!.render(node)}) }
-async function click(label:string){const button=[...container.querySelectorAll('button')].find(x=>x.textContent===label)!;expect(button).toBeTruthy();await act(async()=>{button.click()})}
-async function input(label:string,value:string){const el=container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;await act(async()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(el,value);el.dispatchEvent(new Event('input',{bubbles:true}))})}
+async function click(label:string){const button=[...document.querySelectorAll('button')].find(x=>x.textContent===label)!;expect(button).toBeTruthy();await act(async()=>{button.click()})}
+async function input(label:string,value:string){const el=document.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;await act(async()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(el,value);el.dispatchEvent(new Event('input',{bubbles:true}))})}
 afterEach(async()=>{if(root)await act(async()=>root!.unmount());root=undefined;document.body.replaceChildren();vi.restoreAllMocks()})
 it('owner lock/rotate/share displays generated capability once without persisting it',async()=>{
  const setAccess=vi.fn<GadgetClient['setAccess']>(async()=>{});const storage=vi.spyOn(Storage.prototype,'setItem');
@@ -28,7 +27,7 @@ it('member unlock hands over only the admitted stub and clears the presented key
 })
 it('creates a key-private instance atomically from the selected reusable blueprint',async()=>{
  const createGadget=vi.fn<(...args:Parameters<Overseer['createGadget']>)=>Promise<{getId():Promise<number>;[Symbol.dispose]():void}>>(async()=>({getId:async()=>7,[Symbol.dispose]:vi.fn<()=>void>()}));const onCreated=vi.fn<(id:number)=>void>();await render(<GadgetInstanceCreate api={{listOutputFormats:async()=>[],listLibraryBlueprints:async()=>[{id:'crm-v1',metadata:{title:'CRM'}}]} as never} overseer={{createGadget} as never} onCreated={onCreated}/>);
- await act(async()=>{container.querySelector('details')!.open=true;container.querySelector('details')!.dispatchEvent(new Event('toggle'))});
- const select=container.querySelector<HTMLSelectElement>('select')!;await act(async()=>{select.value='crm-v1';select.dispatchEvent(new Event('change',{bubbles:true}))});await input('App instance name','Private contacts');await click('Create app instance');
+ await click('Add app here');
+ const select=document.querySelector<HTMLSelectElement>('select')!;await act(async()=>{select.value='crm-v1';select.dispatchEvent(new Event('change',{bubbles:true}))});await input('App instance name','Private contacts');await click('Create app instance');
  expect(createGadget.mock.calls[0]).toEqual(['Private contacts',undefined,undefined,{visibility:'key',key:expect.stringMatching(/^[A-Za-z0-9_-]{43}$/)},'crm-v1']);expect(onCreated).toHaveBeenCalledWith(7);
 })

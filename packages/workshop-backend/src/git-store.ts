@@ -260,8 +260,34 @@ export class GitStore {
   async readCommitFiles(oid: string): Promise<Map<string, string>> {
     let { commit } = await readCommit({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache });
     let files = new Map<string, string>();
-    await this.#collectTreeFiles(commit.tree, "", files);
-    return files;
+    try {
+      await this.#collectTreeFiles(commit.tree, "", files);
+      return files;
+    } finally {
+      // A package already owns its decoded strings. Do not retain a second copy of
+      // every large blob across package revisions in isomorphic-git's parse cache.
+      this.#cache = {};
+    }
+  }
+
+  /** Read one regular source file without materializing the complete commit. */
+  async readCommitFile(oid:string,path:string):Promise<string>{
+    const parts=path.split('/'),cache={};
+    if(parts.some(part=>!part||part==='.'||part==='..'))throw new Error('Invalid source path.');
+    let treeOid=await this.commitTree(oid);
+    for(let index=0;index<parts.length;index++){
+      const {tree}=await readTree({fs:this.#fs,gitdir:GITDIR,oid:treeOid,cache});
+      const entry=tree.find(entry=>entry.path===parts[index]);
+      if(!entry)throw new Error('Candidate source file is missing.');
+      if(index===parts.length-1){
+        if(entry.type!=='blob'||!['100644','100755'].includes(entry.mode))throw new Error('Candidate source is not a regular file.');
+        const {blob}=await readBlob({fs:this.#fs,gitdir:GITDIR,oid:entry.oid,cache});
+        return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(blob);
+      }
+      if(entry.type!=='tree')throw new Error('Candidate source directory is missing.');
+      treeOid=entry.oid;
+    }
+    throw new Error('Candidate source path is empty.');
   }
 
   /**

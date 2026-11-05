@@ -4,7 +4,7 @@ import {EmbeddedChatBroker,EmbeddedRendererProxy} from './embedded-agent';
 
 import {prepareCodeChangeStorage} from './code-change-storage';
 import type {NativeChatHost,NativeChatGuard,NativeChatScope,NativeChatTarget,NativeChatTurn,NativeChatSink} from '@gadgets/workshop-shared/embedded-agent';
-import {readCompiledModules} from './compiled-modules';
+import {readCompiledModules,hasCompiledUi} from './compiled-modules';
 import type {GadgetAlarmScheduler,GadgetCapabilityHandler,GadgetProjectionNotification,GadgetProjectionConsumerObserver} from '@gadgets/workshop-shared/gadget-capabilities-server';
 import {previewGadgetCodeUpgrade} from './gadget-code-upgrade';
 import {chatHistoryBytes, CHAT_HISTORY_PAGE_BYTES, CHAT_HISTORY_ITEM_BYTES} from './chatHistoryPaging';
@@ -18,7 +18,7 @@ import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
-  type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
+  MAX_CODE_CHANGE_SIZE, type FileChange, type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { type AgentCatalog, type GatekeeperContext, type GatekeeperAlarmScheduler, Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
@@ -5862,10 +5862,14 @@ export class Gadget extends AuthoredGadget {
   }
 
   async getGadgetUiBundle(gadgetId: WorkpieceId, chatId?: number): Promise<UiBundle | null> {
-    // TODO: Bundle the UI? For now we just return client.js.
     this.checkChatExistsAndMaterializeChanges(chatId);
-    let jsCode = (await this.readGadgetFiles(gadgetId, chatId)).get("client.js");
-    return jsCode !== undefined ? {jsCode} : null;
+    const files = await this.readGadgetFiles(gadgetId, chatId);
+    const packaged = (await readCompiledModules(files, 'ui'))['client.js'];
+    if (packaged !== undefined && files.has('client.js')) throw Error('Conflicting UI entry points.');
+    const jsCode = packaged ?? files.get('client.js');
+    if (jsCode !== undefined && typeof jsCode !== 'string') throw Error('Invalid UI module.');
+    if(jsCode===undefined)return null;
+    return jsCode.length>8*1024*1024?{jsCode:'',source:new Blob([jsCode]).stream()}:{jsCode};
   }
 
   async getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number)
@@ -5895,7 +5899,7 @@ export class Gadget extends AuthoredGadget {
       let bundle = await this.getGadgetUiBundle(gadgetId, chatId);
       if (!bundle) throw new Error("This Gadget does not have a UI to export.");
       let title = this.getGadgetRecord(gadgetId).title;
-      return renderGadgetInBrowser(browser, bundle.jsCode, title, exportGadget.dup(), format);
+      return renderGadgetInBrowser(browser, bundle.source?await new Response(bundle.source).text():bundle.jsCode, title, exportGadget.dup(), format);
     }
   }
 
@@ -5923,7 +5927,7 @@ export class Gadget extends AuthoredGadget {
       let formats = await readCustomExportFormats(handler, gadget);
       return formats === null
         ? {
-          formats: files.has("client.js") ? defaultExportFormats() : [],
+          formats: files.has('client.js')||hasCompiledUi(files) ? defaultExportFormats() : [],
           handler: null,
           gadget,
         }
@@ -12008,7 +12012,49 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async previewGadgetUpgrade(id: WorkpieceId, source: GadgetUpgradeSource): Promise<GadgetUpgradePreview> {
     const record = this.impl.getGadgetRecord(id);
     if (record.pending || !record.commitId) throw new Error("Accept this gadget before upgrading its code.");
-    return previewGadgetCodeUpgrade(this.impl.env, id, record.commitId, source);
+    const baseCommit=record.commitId;
+    const author=await this.#getClientProfile();
+    return previewGadgetCodeUpgrade(this.impl.env,id,baseCommit,source,{
+     save:files=>this.impl.gitStore.writeFilesAsCommit(files,{parents:[baseCommit],author:commitIdentityForAuthor(author),message:'Stage validated gadget package candidate',timestamp:new Date()}),
+     read:(commitId,path)=>this.impl.gitStore.readCommitFile(commitId,path),
+     stage:async(chatId,candidateCommit,files,sha256)=>{
+      return await this.impl.withChatLock(chatId,async()=>{
+        this.impl.assertChatNotActive(chatId);
+        if(this.impl.getGadgetHead(id)!==baseCommit)throw Error('The gadget moved; preview its upgrade again.');
+        const before=this.impl.chatCodeBase(this.impl.getChatMetaOrThrow(chatId));
+        if(before.pins.some(p=>p.gadgetId!==id))throw Error('Use a review containing only this gadget for the package replacement.');
+        const pin=before.pins.find(p=>p.gadgetId===id);
+        if(pin&&pin.baseCommit!==baseCommit)throw Error('The review has a different code base.');
+        const incoming=new Map(files),changes:[string,number|null][]=files.map(([path,length])=>[path,length]);
+        const base=await this.impl.gitStore.readCommitFiles(baseCommit);
+        const current=(await this.impl.getCurrentChatContent(chatId,this.impl.getChatMetaOrThrow(chatId))).get(id);
+        for(const path of current?.keys()??[])if(!base.has(path)&&!incoming.has(path))throw Error('Use a review without unrelated file additions for this replacement.');
+        for(const path of base.keys())if(!incoming.has(path))changes.push([path,null]);
+        changes.sort(([a],[b])=>a.localeCompare(b));
+        const batches:[string,number|null][][]=[];let group:[string,number|null][]=[];let size=0;
+        for(const entry of changes){const weight=entry[0].length+16+(entry[1]??0);if(group.length&&size+weight>MAX_CODE_CHANGE_SIZE/4){batches.push(group);group=[];size=0;}group.push(entry);size+=weight;}
+        if(group.length)batches.push(group);
+        const identity=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(`${id}:${baseCommit}:${sha256}:${before.generation}`)));
+        const clientId=Array.from(identity,b=>b.toString(16).padStart(2,'0')).join('');
+        const key=`${keyString(chatId)}.${this.clientUserId}:${clientId}`;
+        const ack=this.impl.storage.chatChangeClients.get(key);
+        let position=ack?{generation:ack.generation,revision:ack.revision}:{generation:before.generation,revision:before.revision};
+        const through=Math.min(batches.length,(ack?.seq??0)+4);
+        for(let index=ack?.seq??0;index<through;index++){
+          if(this.impl.getGadgetHead(id)!==baseCommit)throw Error('The gadget moved during package staging.');
+          const change:[string,FileChange][]=[];
+          for(const [path,length]of batches[index])change.push([path,length===null?{remove:true}:{set:await this.impl.gitStore.readCommitFile(candidateCommit,path)}]);
+          position=await this.impl.submitCodeChange(chatId,{...position,clientId,seq:index+1,pins:[{gadgetId:id,baseCommit}],change:{[id]:change}},author,this.clientUserId);
+        }
+        if(through<batches.length)return false;
+        const completed=(await this.impl.getCurrentChatContent(chatId,this.impl.getChatMetaOrThrow(chatId))).get(id);
+        if(!completed||completed.size!==incoming.size)throw Error('The review changed during package staging; no package was activated.');
+        for(const [path]of files)if(completed.get(path)!==await this.impl.gitStore.readCommitFile(candidateCommit,path))throw Error('The staged source differs from the candidate; no package was activated.');
+        this.impl.materializeChatChanges(chatId,this.impl.assertChatNotActive(chatId));
+        return true;
+      });
+     }
+    });
   }
 
   async submitCodeChange(chatId: number, submission: CodeChangeSubmission)

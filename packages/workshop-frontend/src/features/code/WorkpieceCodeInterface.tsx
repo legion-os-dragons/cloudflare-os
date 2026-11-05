@@ -1395,6 +1395,12 @@ export default function WorkpieceCodeInterface({
           pending={key,chatId,clientId:crypto.randomUUID(),batches,next:0,generation:0,revision:0};
           upgradeReviewRef.current = pending;
         }
+        if(candidate.filePages){
+          while(!await candidate.filePages.stageNext(pending.chatId)){if(!requestIsCurrent())throw Error('Reconnect and resume this package review.');}
+          upgradeReviewRef.current=null;
+          if(requestIsCurrent())onReviewChat(pending.chatId);
+          return;
+        }
         // Stage before navigation: changing chats can remount the importer or replace its
         // local OT client, so an Effect after navigation can silently lose the candidate.
         if (!requestIsCurrent()) throw new Error('The selected gadget changed before the review was staged. Open its review conversation before retrying.');

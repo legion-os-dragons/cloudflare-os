@@ -41,7 +41,16 @@ async function installOne(env: InstallEnv, entry: BundledBlueprint)
     : Promise<BlueprintPublicInfo> {
   // Parse through the ordinary archive reader so a corrupt bundled file fails the same way an
   // uploaded one would, rather than producing a half-installed blueprint.
-  const archiveBytes=Uint8Array.fromBase64(entry.archive);
+  let archiveBytes:Uint8Array;
+  if(entry.archiveObjectKey!==undefined){
+    if(entry.archiveObjectKey!==`.bundled-archives/${entry.contentHash}.gadget`)throw Error('Invalid private bundled archive key.');
+    const object=await env.BLUEPRINT_CONTENT.get(entry.archiveObjectKey);
+    if(!object||object.size>32*1024*1024+65536+24)throw Error('Private bundled archive is missing or too large.');
+    archiveBytes=new Uint8Array(await object.arrayBuffer());
+  }else{
+    if(typeof entry.archive!=='string')throw Error('Bundled archive is missing.');
+    archiveBytes=Uint8Array.fromBase64(entry.archive);
+  }
   const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",archiveBytes as BufferSource));
   const actualHash=Array.from(digest,byte=>byte.toString(16).padStart(2,"0")).join("");
   if(actualHash!==entry.contentHash)throw Error("Bundled archive fingerprint does not match its original bytes.");

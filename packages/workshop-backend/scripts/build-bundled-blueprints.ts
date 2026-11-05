@@ -15,7 +15,7 @@
 // so a test writing the default path races them.
 
 import {gzip} from "pako";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BUNDLED_BLUEPRINTS_DIR, generateBundledBlueprintsModule } from "@gadgets/bundled-blueprints";
@@ -27,9 +27,16 @@ const sourceDir = process.env.BUNDLED_BLUEPRINTS_DIR
     : BUNDLED_BLUEPRINTS_DIR;
 const outFile = resolve(pkgRoot, parseOutFlag() ?? join("src", "generated", "bundled-blueprints.ts"));
 
+const externalDir=process.env.BUNDLED_BLUEPRINT_EXTERNAL_ARCHIVES_DIR;
+if(externalDir){await rm(externalDir,{recursive:true,force:true});await mkdir(externalDir,{recursive:true});}
 const { text: generated, count, totalBytes } = await generateBundledBlueprintsModule(sourceDir, {
   builtFrom: process.env.BUNDLED_BLUEPRINTS_DIR ? "BUNDLED_BLUEPRINTS_DIR" : "blueprints/",
   archiveDictionaryGzip: snapshot=>gzip(snapshot,{level:9}),
+  externalizeArchive: externalDir?async(hash,bytes)=>{
+    if(bytes.length<8*1024*1024)return undefined;
+    await writeFile(join(externalDir,hash+'.gadget'),bytes);
+    return '.bundled-archives/'+hash+'.gadget';
+  }:undefined,
 });
 
 // Skip the write when nothing changed. This script runs as a prerequisite of `build` and `test`,

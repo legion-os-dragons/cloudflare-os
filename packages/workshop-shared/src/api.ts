@@ -1695,6 +1695,8 @@ export type OutputSummary = {
  * and to the Gadget's server.
  */
 export type UiBundle = {
+  /** Complete source stream for large bundles; jsCode is empty when present. */
+  source?:ReadableStream<Uint8Array>;
   // URL from which the main bundle of UI code can be downloaded. This download contains all the
   // Gadget's client-side assets. The URL is content-addressed to make it highly cacheable, even
   // across multiple Gadgets sharing the same implementation (blueprint).
@@ -2003,7 +2005,7 @@ export interface Overseer extends RpcTarget {
    */
   getGadget(id: WorkpieceId, key?: string): Promise<RpcStub<GadgetClient>>;
 
-  /** Read and validate replacement code for this existing gadget without changing code, data or bindings. Build-role only; stage the returned files through submitCodeChange and review before mergeChanges. */
+  /** Read and validate replacement code for this existing gadget without changing code, data or bindings. Build-role only; stage through submitCodeChange or the returned candidate capability, then review before mergeChanges. */
   previewGadgetUpgrade(id: WorkpieceId, source: GadgetUpgradeSource): Promise<GadgetUpgradePreview>;
 
   /**
@@ -2803,10 +2805,22 @@ export interface GadgetArchiveUpload extends RpcTarget {
 }
 
 /** A reviewed code candidate from an actual archive or the current revision of a library blueprint. */
-export type GadgetUpgradeSource =
+export type GadgetUpgradeSource = (
     { /** Decode this bounded .gadget archive without importing it into the library. */ type: "archive"; /** Original archive bytes. */ archive: ReadableStream<Uint8Array> }
   | { /** Read an editor-selected archive through a streaming RPC target. */ type: "archive-upload"; /** One-shot target returning the original archive stream. */ archive: RpcStub<GadgetArchiveUpload> }
-  | { /** Read the library's current published revision. */ type: "blueprint"; /** Existing blueprint bearer ID. */ blueprintId: string };
+  | { /** Read the library's current published revision. */ type: "blueprint"; /** Existing blueprint bearer ID. */ blueprintId: string }) & {
+    /** Request bounded source pages for large packages. */ paged?:boolean;
+  };
+
+/** An editor-authorized package candidate; staging creates review changes, never activation. */
+export interface GadgetUpgradeFiles extends RpcTarget {
+  /** Return at most 512 Ki characters, starting at the specified file index. */
+  readPage(offset:number):Promise<{files:[path:string,text:string][];next:number|null}>;
+  /** Stage the complete source in an inactive review; never activate it. */
+  stageReview(chatId:number):Promise<void>;
+  /** Stage one bounded group; true means all source is verified. Resumes acknowledged batches. */
+  stageNext(chatId:number):Promise<boolean>;
+}
 
 /** Validated code candidate. No gadget identity, storage, access policy or bindings are replaced. */
 export type GadgetUpgradePreview = {
@@ -2815,6 +2829,9 @@ export type GadgetUpgradePreview = {
   /** Exact current gadget mainline commit at preview time. */ baseCommit: string;
   /** SHA-256 of the decoded Yjs snapshot. */ contentSha256: string;
   /** Exact text files, as pairs so prototype-like paths survive RPC transport. */ files: [path: string, text: string][];
+  /** Source pages for candidates exceeding an inline RPC response. */ filePages?:RpcStub<GadgetUpgradeFiles>;
+  /** Exact file count when filePages is present. */ fileCount?:number;
+  /** Source names and character lengths for a Git-backed candidate; source is read lazily. */ fileSizes?:[path:string,characters:number][];
   /** Binding names expected by the candidate; review separately in Connections. */ requiredBindings: string[];
 };
 

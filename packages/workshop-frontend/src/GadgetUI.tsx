@@ -368,7 +368,9 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
         const bundle = await gadget.getUiBundle(chatId)
         if (!isCurrent()) return
         if (bundle) {
-          const html = createSandboxedHtml(bundle.jsCode)
+          const code=bundle.source?await new Response(bundle.source).text():bundle.jsCode
+          if(!isCurrent())return
+          const html = createSandboxedHtml(code)
           setSandboxedHtml(html)
         } else {
           setSandboxedHtml(null)

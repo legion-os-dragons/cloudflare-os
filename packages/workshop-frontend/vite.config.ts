@@ -72,7 +72,7 @@ export default defineConfig(({ mode }) => {
     // no such property, but the excess-property check doesn't reach spreads.
     ...runConfig,
     plugins: [
-      TanStackRouterVite({ target: "react", autoCodeSplitting: true }),
+      TanStackRouterVite({ target: "react", autoCodeSplitting: true, routeFileIgnorePattern: " [2-9][0-9]*[.]" }),
       react(),
       tailwindcss(),
       tsconfigPaths(),

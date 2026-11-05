@@ -2,7 +2,7 @@ import type { GadgetCapabilityJson } from '@gadgets/workshop-shared/gadget-capab
 import {GadgetConnectionsSession} from './features/gadgets/connectionsSession'
 import { GadgetDictationSession } from './features/gadgets/dictationSession'
 import { useState, useEffect, useRef } from 'react'
-import { Text, Loader, Banner, Button } from '@cloudflare/kumo'
+import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
 import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
@@ -692,13 +692,6 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
 
   return (
     <div className="flex min-h-0 flex-col" style={{ height, width: '100%' }}>
-      {onRetryConnection && (
-        <div className="flex shrink-0 justify-end border-b border-kumo-line bg-kumo-base px-2 py-1">
-          <Button variant="secondary" onClick={onRetryConnection}>
-            Reconnect view
-          </Button>
-        </div>
-      )}
       <iframe
         key={`${reloadTrigger}:${iframeGeneration}`}
         ref={iframeRef}

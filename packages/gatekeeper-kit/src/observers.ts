@@ -5,7 +5,9 @@ import type {
   GatekeeperUserVerifier,
   ObservationAuthorizer,
   ObservationDescription,
+  WorkspaceConnectionGrantVerifier,
 } from "@gadgets/workshop-shared/gatekeeper";
+
 import {
   asVerifier,
   NOTHING_TO_RESOLVE,
@@ -58,6 +60,8 @@ export function isObservationRefused(error: unknown): boolean {
 export type AclChecks = "per-read" | "no-observers" | "unsupported";
 
 type ObserverStrategyBase = {
+  /** Recheck an explicitly delegated baseline on every read. */
+  prepareBaseline?(): Promise<ObservationCheck>;
   /**
    * Attempts to admit an observer.
    * @param id Observer ID.
@@ -168,6 +172,31 @@ export function trackedCollectionObservers<V>(options: ObserverTrackerOptions<V>
     removeObserver: async id => tracker.removeObserver(id),
     prepare: collectionIds => tracker.prepareObservation(collectionIds),
     observerIds: () => tracker.observerIds(),
+    prepareWithheld: () => tracker.prepareWithheld(),
+  };
+}
+
+/** Share only this connection's baseline, using live native owner/admin grants. */
+export function workspaceDelegatedObservers(options: {
+  kv: ObserverTrackerOptions<Fetcher<WorkspaceConnectionGrantVerifier>>['kv'];
+  resourceUrl: string;
+}): ObserverStrategy {
+  const tracker = new ObserverTracker<Fetcher<WorkspaceConnectionGrantVerifier>>({
+    kv: options.kv,
+    collectionPrefix: 'workspace-grant-resource:',
+    verifyBaseline: async proof => {
+      if (await proof.hasAccess(options.resourceUrl) !== true) throw new Error('The workspace owner or an administrator must grant you access to this connection.');
+    },
+    hasCollectionAccess: async (proof, resources) => Promise.all(resources.map(resource => proof.hasAccess(resource))),
+    maxTrackedCollections: 1,
+  });
+  return {
+    aclChecks: 'per-read',
+    addObserver: (id, proof) => tracker.addObserver(id, proof as Fetcher<WorkspaceConnectionGrantVerifier>),
+    removeObserver: async id => {tracker.removeObserver(id)},
+    observerIds: () => tracker.observerIds(),
+    prepare: resources => tracker.prepareObservation(resources),
+    prepareBaseline: () => tracker.prepareObservation([options.resourceUrl]),
     prepareWithheld: () => tracker.prepareWithheld(),
   };
 }
@@ -320,7 +349,7 @@ export class ObservationGate implements Disposable {
   async #prepare(scope: ObservationScope): Promise<ObservationCheck> {
     switch (scope.kind) {
       case "baseline":
-        return NOTHING_TO_RESOLVE;
+        return this.#strategy.prepareBaseline ? await this.#strategy.prepareBaseline() : NOTHING_TO_RESOLVE;
       case "withholdFromObservers":
         return this.#strategy.prepareWithheld();
       case "collections":

@@ -1060,7 +1060,26 @@ export type AdminFormat = {
  * which gatekeeper connectors/resources are offered — NOT authentication config (that's env-var
  * driven). Each setter throws on invalid input.
  */
+export type WorkspaceConnectionAccessView = {
+  workspaceId: string;
+  ownerProfileId: string;
+  revision: number;
+  people: CollaboratorInfo[];
+  connections: {id:number;title:string;resourceUrl:string;delegatable:boolean;grantedTo:string[]}[];
+  audit: {id:string;at:string;actor:string;action:string;profileId:string;connectionId:number|null}[];
+};
+
+/** UI-facing management capability. Neither provider credentials nor financial data are exposed. */
+export interface WorkspaceConnectionAccess extends RpcTarget {
+  getView(): Promise<WorkspaceConnectionAccessView>;
+  setConnectionAccess(profileId:string, connectionId:number, allowed:boolean, expectedRevision:number):Promise<WorkspaceConnectionAccessView>;
+  invitePerson(email:string, role:CollaboratorRole):Promise<WorkspaceConnectionAccessView>;
+  removePerson(profileId:string):Promise<WorkspaceConnectionAccessView>;
+}
+
 export interface AdminApi {
+  /** Manage a workspace's people and explicitly delegated connections, without opening its data. */
+  getWorkspaceAccess(workspaceId: string): Promise<WorkspaceConnectionAccess>;
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
 
@@ -2508,6 +2527,9 @@ export interface Overseer extends RpcTarget {
 
   /** List all collaborators. Available to owner and all collaborators. */
   listCollaborators(): Promise<CollaboratorInfo[]>;
+
+  /** Owner-only connection and membership management, using the same UI as deployment admins. */
+  getWorkspaceAccess(): Promise<WorkspaceConnectionAccess>;
 
   /**
    * Add a collaborator by username/email. The caller must be the owner or an existing
@@ -4718,6 +4740,8 @@ export type PermissionEdge = {
   /** Granted directly by another user. */
   type: "user";
   sharer: string;  // profile.id of the person who shared
+  /** This edge was issued by the named deployment administrator, not an impersonated owner. */
+  authority?: "deployment-admin";
   note?: string;
 } | {
   /** Gained by redeeming a share key. */

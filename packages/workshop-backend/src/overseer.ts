@@ -1,4 +1,6 @@
 import type {PermissionEdge} from '@gadgets/workshop-shared/api';
+import type {WorkspaceConnectionAccess,WorkspaceConnectionAccessView} from '@gadgets/workshop-shared/api';
+import type {WorkspaceConnectionGrantVerifier} from '@gadgets/workshop-shared/gatekeeper';
 import type {GadgetAccountDirectory} from '@gadgets/workshop-shared/gadget-capabilities';
 import {EmbeddedChatBroker,EmbeddedRendererProxy} from './embedded-agent';
 
@@ -1183,6 +1185,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextGatekeeperId: 0,
 
       nextActionId: 0,
+      connectionAccessRevision: 0,
       nextChatId: 0,
       nextHookId: 0,
       nextAgentCallId: 0,
@@ -1276,6 +1279,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       gatekeeperContinuations: collection<{id: number; at: number; claim?: string}>()({
         primaryKey: "id",
       }),
+
+      connectionAccessGrants: collection<{id:string;profileId:string;gatekeeperId:number;resourceUrl:string;grantedBy:string;at:string}>()({primaryKey:'id'}),
+      connectionAccessAudit: collection<{id:string;at:string;actor:string;action:string;profileId:string;connectionId:number|null}>()({primaryKey:'id'}),
 
       gatekeepers: collection<GatekeeperRecord>()({
         primaryKey: "id",
@@ -10299,13 +10305,27 @@ export class Gadget extends AuthoredGadget {
     const MAX_CONFIG_REPROMPTS = 1;
 
     try {
+      // Delegations are explicit native grants, not inherited provider credentials.
+      const delegated = new Set<number>();
+      for (const gk of inScope) {
+        const facet = this.getGatekeeperFacet(gk.id);
+        if (!(await facet.describe()).workspaceDelegation) continue;
+        if (!await this.hasConnectionAccess(profileId,gk.id,gk.resourceUrl??''))
+          throw new Error(`The workspace owner or an administrator must grant your account access to ${observerBindingTitle(gk)} in Share → Connection access.`);
+        const proof=this.ctx.exports.WorkspaceConnectionGrantProof({props:{overseerId:this.ctx.id.toString(),gatekeeperId:gk.id,profileId}});
+        const delegatedFacet=facet as Fetcher<Gatekeeper<any>&Required<Pick<Gatekeeper<any>,'addWorkspaceObserver'>>>;
+        await this.#withObserverGatekeeperLock(observerId, gk.id, () =>
+          delegatedFacet.addWorkspaceObserver(observerId,proof));
+        newlyAdded.add(gk.id);
+        delegated.add(gk.id);
+      }
       while (true) {
         // 3. Determine uncovered bindings: in-scope gatekeepers with no account choice yet. Ambient
         //    bindings use the collaborator's matching provided account automatically; unlike an
         //    ordinary connection, there is no meaningful account choice when one already exists.
         //    On a re-prompt, leave a failed ambient binding uncovered so the client can explain the
         //    failure rather than silently retrying the same account.
-        let uncovered = inScope.filter(gk => !(gk.id in accountChoices));
+        let uncovered = inScope.filter(gk => !delegated.has(gk.id) && !(gk.id in accountChoices));
         let ambientNeeds = uncovered.flatMap(gk => {
           let spec = gk.creationSpec;
           return spec?.type === "ambient" && !passFailures.has(gk.id)
@@ -10323,7 +10343,7 @@ export class Gadget extends AuthoredGadget {
             let accountId = accountsByVendor.get(need.vendorId);
             if (accountId !== undefined) accountChoices[need.gatekeeperId] = accountId;
           }
-          uncovered = inScope.filter(gk => !(gk.id in accountChoices));
+          uncovered = inScope.filter(gk => !delegated.has(gk.id) && !(gk.id in accountChoices));
         }
 
         // 4. If there are uncovered bindings, ask the client to choose accounts for them.
@@ -10369,6 +10389,7 @@ export class Gadget extends AuthoredGadget {
         let failures = new Map<number, ObserverBindingFailure>();
 
         await Promise.all(inScope.map(async gk => {
+          if (delegated.has(gk.id)) return;
           let accountId = accountChoices[gk.id];
           let vendorId = observerVendorId(gk);
           if (!vendorId) {
@@ -10518,12 +10539,65 @@ export class Gadget extends AuthoredGadget {
 
   #sharingManager?: SharingManager;
 
+  isDeploymentAdmin(profileId:string):boolean {
+    let admins:unknown=this.env.ADMINS;
+    if(typeof admins==='string'){try{admins=JSON.parse(admins)}catch{return false}}
+    return Array.isArray(admins)&&admins.includes(profileId);
+  }
+
+  async hasConnectionAccess(profileId:string, gatekeeperId:number, resourceUrl:string):Promise<boolean>{
+    if(!(await this.getSharingManager()).getEffectiveRole(profileId))return false;
+    const connection=this.storage.gatekeepers.get(gatekeeperId);
+    const grant=this.storage.connectionAccessGrants.get(`${gatekeeperId}/${profileId}`);
+    return !!connection&&!!grant&&grant.resourceUrl===resourceUrl&&connection.resourceUrl===resourceUrl;
+  }
+
+  async connectionAccessView():Promise<WorkspaceConnectionAccessView>{
+    const ownerProfileId=await this.getOwnerProfileId();
+    const people=(await this.getSharingManager()).listCollaborators();
+    const grants=Array.from(this.storage.connectionAccessGrants.list());
+    const connections=await Promise.all(this.#inScopeGatekeepers('build').map(async record=>{
+      const description=await this.getGatekeeperFacet(record.id).describe();
+      return{id:record.id,title:observerBindingTitle(record),resourceUrl:record.resourceUrl??description.url,
+        delegatable:description.workspaceDelegation===true,
+        grantedTo:grants.filter(grant=>grant.gatekeeperId===record.id&&grant.resourceUrl===record.resourceUrl).map(grant=>grant.profileId)};
+    }));
+    return{workspaceId:this.ctx.id.toString(),ownerProfileId,people,connections,
+      revision:this.storage.connectionAccessRevision.get(),
+      audit:Array.from(this.storage.connectionAccessAudit.list()).sort((a,b)=>b.at.localeCompare(a.at)).slice(0,100)};
+  }
+
+  recordConnectionAccessAudit(actor:string,action:string,profileId:string,connectionId:number|null):void{
+    this.storage.connectionAccessAudit.put({id:crypto.randomUUID(),at:new Date().toISOString(),actor,action,profileId,connectionId});
+    this.storage.connectionAccessRevision.put(this.storage.connectionAccessRevision.get()+1);
+  }
+
+  async changeConnectionAccess(actor:string,profileId:string,connectionId:number,allowed:boolean,expectedRevision:number):Promise<WorkspaceConnectionAccessView>{
+    if(typeof profileId!=='string'||!Number.isSafeInteger(connectionId)||typeof allowed!=='boolean'||!Number.isSafeInteger(expectedRevision))throw Error('Invalid connection access change.');
+    const connection=this.storage.gatekeepers.get(connectionId);
+    if(!connection)throw Error('This connection no longer exists.');
+    const description=await this.getGatekeeperFacet(connectionId).describe();
+    if(!description.workspaceDelegation||!connection.resourceUrl)throw Error('This provider requires the recipient’s own account and does not support owner delegation.');
+    const sharing=await this.getSharingManager();
+    if(allowed&&!sharing.getEffectiveRole(profileId))throw Error('Invite this person to the workspace first.');
+    if(profileId===await this.getOwnerProfileId())throw Error('The owner already controls this connection.');
+    if(this.storage.connectionAccessRevision.get()!==expectedRevision)throw Error('Access changed while this page was open. Refresh and review it again.');
+    const id=`${connectionId}/${profileId}`;
+    this.ctx.storage.transactionSync(()=>{
+      if(allowed)this.storage.connectionAccessGrants.put({id,profileId,gatekeeperId:connectionId,resourceUrl:connection.resourceUrl!,grantedBy:actor,at:new Date().toISOString()});
+      else this.storage.connectionAccessGrants.delete(id);
+      this.recordConnectionAccessAudit(actor,allowed?'Granted connection access':'Revoked connection access',profileId,connectionId);
+    });
+    if(!allowed)this.scheduleAccessRestart('Workspace restarted to revoke connection access.');
+    return this.connectionAccessView();
+  }
+
   // Collaborator authorization / sharing / permission logic. Memoized for the DO instance.
   // Resolving the owner's profile ID may require an RPC on first use; thereafter it's cached.
   async getSharingManager(): Promise<SharingManager> {
     if (!this.#sharingManager) {
       this.#sharingManager = new SharingManager(
-          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get());
+          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get(), id=>this.isDeploymentAdmin(id));
     }
     return this.#sharingManager;
   }
@@ -10650,6 +10724,16 @@ type OverseerRestoreParams = {type:'embeddedRenderer';chatId:number}|{
 
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   private impl: OverseerImpl;
+
+  async checkWorkspaceConnectionGrant(profileId:string,connectionId:number,resourceUrl:string):Promise<boolean>{
+    return this.impl.hasConnectionAccess(profileId,connectionId,resourceUrl);
+  }
+
+  async adminWorkspaceAccess(adminProfileId:string):Promise<WorkspaceConnectionAccess>{
+    if(!this.impl.isDeploymentAdmin(adminProfileId))throw Error('Deployment administrator access required.');
+    await this.impl.getOwnerProfileId();
+    return new WorkspaceConnectionAccessImpl(this.impl,adminProfileId,true);
+  }
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -11263,6 +11347,46 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 }
 
+@validateRpc()
+class WorkspaceConnectionAccessImpl extends RpcTarget implements WorkspaceConnectionAccess {
+  constructor(private impl:OverseerImpl,private actor:string,private admin:boolean){super()}
+  async #check():Promise<void>{
+    if(this.admin){if(!this.impl.isDeploymentAdmin(this.actor))throw Error('Administrator access was revoked.');}
+    else if(this.actor!==await this.impl.getOwnerProfileId())throw Error('Workspace owner access required.');
+  }
+  async getView():Promise<WorkspaceConnectionAccessView>{await this.#check();return this.impl.connectionAccessView()}
+  async setConnectionAccess(profileId:string,connectionId:number,allowed:boolean,expectedRevision:number):Promise<WorkspaceConnectionAccessView>{
+    await this.#check();return this.impl.changeConnectionAccess(this.actor,profileId,connectionId,allowed,expectedRevision);
+  }
+  async invitePerson(email:string,role:CollaboratorRole):Promise<WorkspaceConnectionAccessView>{
+    await this.#check();
+    if(typeof email!=='string'||email!==email.toLowerCase()||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!['use','build'].includes(role))throw Error('Enter an existing account’s exact email and access level.');
+    const user=this.impl.users.getByName(email),profile=await user.whoamiIfExists();
+    if(!profile)throw Error('This person has not signed into this deployment. No account was created.');
+    await this.#check();
+    (await this.impl.getSharingManager()).addCollaborator({caller:{profileId:this.actor,isOwner:!this.admin,isAdmin:this.admin},profile,role});
+    this.impl.recordConnectionAccessAudit(this.actor,`Granted ${role==='build'?'full workspace':'gadget'} access`,profile.id,null);
+    return this.impl.connectionAccessView();
+  }
+  async removePerson(profileId:string):Promise<WorkspaceConnectionAccessView>{
+    await this.#check();
+    const affected=(await this.impl.getSharingManager()).removeCollaborator({profileId:this.actor,isOwner:!this.admin,isAdmin:this.admin},profileId,[]);
+    for(const grant of this.impl.storage.connectionAccessGrants.list())if(grant.profileId===profileId)this.impl.storage.connectionAccessGrants.delete(grant.id);
+    this.impl.recordConnectionAccessAudit(this.actor,'Removed workspace access',profileId,null);
+    if(affected.length)this.impl.scheduleAccessRestart('Workspace restarted to revoke member access.');
+    return this.impl.connectionAccessView();
+  }
+}
+
+type WorkspaceConnectionGrantProofProps={overseerId:string;gatekeeperId:number;profileId:string};
+@validateRpc()
+export class WorkspaceConnectionGrantProof extends WorkerEntrypoint<Cloudflare.Env,WorkspaceConnectionGrantProofProps> implements WorkspaceConnectionGrantVerifier {
+  async hasAccess(resourceUrl:string):Promise<boolean>{
+    const root=this.ctx.exports.OverseerDurableObject.get(this.ctx.exports.OverseerDurableObject.idFromString(this.ctx.props.overseerId));
+    return root.checkWorkspaceConnectionGrant(this.ctx.props.profileId,this.ctx.props.gatekeeperId,resourceUrl);
+  }
+}
+
 type GatekeeperCaller = {
   from: "agent";
   chatId: number;
@@ -11335,7 +11459,6 @@ export class GadgetProjectionLoopback extends WorkerEntrypoint<
 > {
   #session() {
     const ns = this.ctx.exports.OverseerDurableObject;
-    // @ts-expect-error: Native RPC mapped session type exceeds compiler depth, as in GatekeeperLoopback.
     return ns
       .get(ns.idFromString(this.ctx.props.overseerId))
       .startGatekeeperSession(this.ctx.props.target, this.ctx.props.caller);
@@ -13212,6 +13335,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return (await this.impl.getSharingManager()).listCollaborators();
   }
 
+  async getWorkspaceAccess():Promise<WorkspaceConnectionAccess>{
+    if(!this.isOwner)throw Error('Only the workspace owner can manage connection access here. Administrators can use Workspace access in Admin.');
+    return new WorkspaceConnectionAccessImpl(this.impl,this.clientProfileId,false);
+  }
+
   async addCollaborator(username: string, role: CollaboratorRole, note?: string)
       : Promise<CollaboratorInfo | null> {
     // Look up the user DO to check if the account exists.
@@ -13616,6 +13744,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async listObserverRequirements(
       _role: CollaboratorRole): Promise<ObserverBindingNeed[]> { this.#deny(); }
   async listCollaborators(): Promise<CollaboratorInfo[]> { this.#deny(); }
+  async getWorkspaceAccess():Promise<WorkspaceConnectionAccess>{this.#deny();}
   async addCollaborator(_username: string, _role: CollaboratorRole, _note?: string)
       : Promise<CollaboratorInfo | null> { this.#deny(); }
   async removeCollaborator(_profileId: string, _keepUsers: string[])

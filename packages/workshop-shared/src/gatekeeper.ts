@@ -228,6 +228,9 @@ export type ResourceDescription = {
    */
   tsType: string;
 
+  /** The binding can verify a native owner delegation without a collaborator account. */
+  workspaceDelegation?: true;
+
   /** Indicates that getSlashCommandProvider() is available. */
   hasSlashCommands?: true;
 
@@ -260,7 +263,7 @@ export type SupportedResource = {
    * Display-only notice that this resource rejects every collaborator observer.
    * The UI must not offer account setup as a remedy. addObserver remains authoritative.
    */
-  observerAccess?: "owner-only";
+  observerAccess?: "owner-only" | "owner-delegated";
 
   /**
    * If true, this resource type is independently grantable. The user can enable or disable it at
@@ -896,7 +899,14 @@ export interface GatekeeperContext {
   alarms: Fetcher<GatekeeperAlarmScheduler>;
 }
 
+/** Native proof of a live, explicit connection grant; contains no provider credential. */
+export interface WorkspaceConnectionGrantVerifier extends WorkerEntrypoint {
+  hasAccess(resourceUrl: string): Promise<boolean>;
+}
+
 export interface Gatekeeper<Session> extends DurableObject {
+  /** Verify an explicitly configured owner delegation. Never supplied by gadget code. */
+  addWorkspaceObserver?(id: string, proof: Fetcher<WorkspaceConnectionGrantVerifier>): Promise<void>;
   /**
    * Get more info on the specific resource without actually granting access. This information is
    * to be presented to the user in the UI, before the user actually confirms they want to grant

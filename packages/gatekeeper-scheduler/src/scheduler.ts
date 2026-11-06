@@ -16,7 +16,7 @@ import type {
   GatekeeperConnectOptions,
   GatekeeperUiFrame,
   GatekeeperUser,
-  GatekeeperUserVerifier,
+  GatekeeperUserVerifier, WorkspaceConnectionGrantVerifier,
   HookController,
   HookInitiator,
   HookTargetMetadata,
@@ -231,6 +231,7 @@ export class SchedulerGatekeeper
   /** Describes the ambient Scheduled Tasks binding. */
   async describe(): Promise<ResourceDescription> {
     return {
+      workspaceMemberObservation: true,
       url: "scheduler://tasks",
       title: "Scheduled Tasks",
       snippet: "Run workspace callbacks on recurring and one-shot schedules.",
@@ -274,6 +275,9 @@ export class SchedulerGatekeeper
 
   /** Accepts collaborators under the low-stakes observer policy. */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
+
+  /** This producer already permits all workspace members; no provider identity is claimed. */
+  async addWorkspaceObserver(_id: string, _proof: Fetcher<WorkspaceConnectionGrantVerifier>): Promise<void> {}
 
   /** Removes a collaborator; no observer state is retained. */
   async removeObserver(_id: string): Promise<void> {}

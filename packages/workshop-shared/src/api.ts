@@ -1060,6 +1060,30 @@ export type AdminFormat = {
   bundled: boolean;
 };
 
+/** Current workspace membership, connection grants and the latest access audit page. */
+export type WorkspaceConnectionAccessView = {
+  workspaceId: string;
+  ownerProfileId: string;
+  revision: number;
+  people: CollaboratorInfo[];
+  connections: {id:number;title:string;resourceUrl:string;delegatable:boolean;workspaceMembers:boolean;grantedTo:string[]}[];
+  audit: {id:string;at:string;actor:string;action:string;profileId:string;connectionId:number|null}[];
+};
+
+/** UI-facing management capability. Neither provider credentials nor financial data are exposed. */
+export interface WorkspaceConnectionAccess extends RpcTarget {
+  /** Read current membership and connection access without exposing provider credentials. */
+  getView(): Promise<WorkspaceConnectionAccessView>;
+  /** Change one connection grant only if the displayed revision is still current. */
+  setConnectionAccess(profileId:string, connectionId:number, allowed:boolean, expectedRevision:number):Promise<WorkspaceConnectionAccessView>;
+  /** Invite an existing deployment account with the selected native collaborator role. */
+  invitePerson(email:string, role:CollaboratorRole):Promise<WorkspaceConnectionAccessView>;
+  /** Remove membership and associated grants, severing affected active sessions. */
+  removePerson(profileId:string):Promise<WorkspaceConnectionAccessView>;
+  /** Run the same connection admission checks used when this member opens the workspace. */
+  checkPersonAccess(profileId:string):Promise<{ready:boolean;message:string}>;
+}
+
 /**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
@@ -1068,6 +1092,8 @@ export type AdminFormat = {
  * driven). Each setter throws on invalid input.
  */
 export interface AdminApi {
+  /** Manage a workspace's people and explicitly delegated connections, without opening its data. */
+  getWorkspaceAccess(workspaceId: string): Promise<WorkspaceConnectionAccess>;
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
 
@@ -2515,6 +2541,9 @@ export interface Overseer extends RpcTarget {
 
   /** List all collaborators. Available to owner and all collaborators. */
   listCollaborators(): Promise<CollaboratorInfo[]>;
+
+  /** Owner-only connection and membership management, using the same UI as deployment admins. */
+  getWorkspaceAccess(): Promise<WorkspaceConnectionAccess>;
 
   /**
    * Add a collaborator by username/email. The caller must be the owner or an existing
@@ -4725,6 +4754,8 @@ export type PermissionEdge = {
   /** Granted directly by another user. */
   type: "user";
   sharer: string;  // profile.id of the person who shared
+  /** This edge was issued by the named deployment administrator, not an impersonated owner. */
+  authority?: "deployment-admin";
   note?: string;
 } | {
   /** Gained by redeeming a share key. */

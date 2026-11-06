@@ -5,6 +5,7 @@
 // supplies. The base never touches the Durable Object, the account, or the endpoint's credentials.
 
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
+import { ObservationGate, type ObservationInput, type ObserverStrategy } from "@gadgets/gatekeeper-kit/observers";
 import type { ActionDescription, ActionKind, ApprovalQueue }
   from "@gadgets/workshop-shared/gatekeeper";
 
@@ -108,14 +109,22 @@ function requireToolName(method: string, name: unknown): asserts name is string 
 export class McpSessionBase extends RpcTarget {
   #host: McpSessionHost;
   #queue: RpcStub<ApprovalQueue>;
+  #observations?: ObservationGate;
 
-  constructor(host: McpSessionHost, queue: RpcStub<ApprovalQueue>) {
+  constructor(host: McpSessionHost, queue: RpcStub<ApprovalQueue>, observers?: ObserverStrategy) {
     super();
     this.#host = host;
     this.#queue = queue;
+    if(observers)this.#observations=new ObservationGate(queue.dup(),observers);
+  }
+
+  async #authorizeObservation(input:ObservationInput):Promise<void> {
+    if(this.#observations)await this.#observations.authorize(input,{kind:'baseline'});
+    else await this.#queue.authorizeObservation(input);
   }
 
   [Symbol.dispose](): void {
+    this.#observations?.[Symbol.dispose]();
     (this.#queue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
 
@@ -124,7 +133,7 @@ export class McpSessionBase extends RpcTarget {
   ): Promise<McpToolInfo[] | McpToolSummary[]> {
     if (options === undefined) {
       const tools = await this.#host.tools();
-      await this.#queue.authorizeObservation({
+      await this.#authorizeObservation({
         title: `${this.#host.serverName}: list tools`,
         description:
           `Read the tool catalog of the MCP server **${this.#host.serverName}** ` +
@@ -143,7 +152,7 @@ export class McpSessionBase extends RpcTarget {
     if (hasName) {
       requireToolName("listTools", options.name);
       const tool = await this.#host.findTool(options.name);
-      await this.#queue.authorizeObservation({
+      await this.#authorizeObservation({
         title: `${this.#host.serverName}: find tool`,
         description:
           `Looked for ${codeSpan(options.name, MAX_TOOL_NAME_CHARS)} on the MCP server ` +
@@ -162,7 +171,7 @@ export class McpSessionBase extends RpcTarget {
       throw new Error("listTools({ search }) requires one or more search terms.");
     }
     const tools = await this.#host.searchTools(trimmed);
-    await this.#queue.authorizeObservation({
+    await this.#authorizeObservation({
       title: `${this.#host.serverName}: search tools`,
       description:
         `Searched the tool catalog of the MCP server **${this.#host.serverName}** ` +
@@ -205,7 +214,7 @@ export class McpSessionBase extends RpcTarget {
     if (entry.mode === "read") {
       const result = await host.call(client => client.callTool(name, toolArgs));
       // Authorize before the data is handed back, per the gatekeeper contract.
-      await this.#queue.authorizeObservation({
+      await this.#authorizeObservation({
         title, description: text, ...(fields ? { fields } : {}),
       });
       return toCallResult(result);
@@ -276,7 +285,7 @@ export class McpSessionBase extends RpcTarget {
           ?? { status: "ok" as const, content: [], text: "", isError: false };
         // The result was produced while the Gadget was not looking, so it becomes an observation at
         // the moment it is handed over rather than when the call was applied.
-        await this.#queue.authorizeObservation({
+        await this.#authorizeObservation({
           title: `${host.serverName}: result of ${stored.toolName}`,
           description:
             `Read the response from the approved call to \`${stored.toolName}\` on ` +

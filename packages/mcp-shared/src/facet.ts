@@ -7,6 +7,7 @@ import type {
   ApprovalQueue,
   Gatekeeper,
   GatekeeperUserVerifier,
+  WorkspaceConnectionGrantVerifier,
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
@@ -31,6 +32,7 @@ import { matchesToolQuery, toolQueryTerms, MAX_SEARCH_RESULTS } from "./tool-sea
 import { McpSessionBase, type McpSessionHost, type StoredAction } from "./session.js";
 import { installToolMethods } from "./session-methods.js";
 import { observerRefusalMessage } from "./sharing-policy.js";
+import { workspaceDelegatedObservers, type ObserverStrategy } from "@gadgets/gatekeeper-kit/observers";
 import {
   actionKindFor,
   classifyTool,
@@ -46,6 +48,7 @@ type FacetProps = {
 type SessionConstructor<Session extends McpSessionBase> = new (
   host: McpSessionHost,
   queue: RpcStub<ApprovalQueue>,
+  observers?: ObserverStrategy,
 ) => Session;
 
 const MAX_CONCURRENT_DISCOVERIES = 4;
@@ -64,6 +67,19 @@ export abstract class McpFacetBase<
   #hydrated = new HydratedTools();
   #activeDiscoveries = 0;
   #waitingDiscoveries: Array<() => void> = [];
+  #workspaceObservers?: ObserverStrategy;
+
+  /** Connectors opt in only when native owners can delegate this exact scoped binding. */
+  protected get supportsWorkspaceDelegation(): boolean { return false; }
+
+  #delegatedObservers(): ObserverStrategy {
+    if (!this.supportsWorkspaceDelegation) throw new Error(observerRefusalMessage(this.observerName));
+    return this.#workspaceObservers ??= workspaceDelegatedObservers({kv:this.ctx.storage.kv,resourceUrl:this.resourceUrl});
+  }
+
+  async addWorkspaceObserver(id:string,proof:Fetcher<WorkspaceConnectionGrantVerifier>):Promise<void> {
+    await this.#delegatedObservers().addObserver(id,proof);
+  }
 
   #actions(): ActionStore {
     return this.#actionStore ??= new ActionStore(this.ctx.storage.sql);
@@ -232,7 +248,7 @@ export abstract class McpFacetBase<
         event: "session.tool-methods.unavailable", error: err,
       });
     }
-    return new SessionClass(this, approvalQueue.dup());
+    return new SessionClass(this, approvalQueue.dup(), this.supportsWorkspaceDelegation ? this.#delegatedObservers() : undefined);
   }
 
   /** Refuses observers so MCP bindings can only be opened by their owner. */
@@ -240,8 +256,10 @@ export abstract class McpFacetBase<
     throw new Error(observerRefusalMessage(this.observerName));
   }
 
-  /** Removes no observer state because observers are never admitted. */
-  async removeObserver(_id: string): Promise<void> {}
+  /** Forget an explicit native delegation; ordinary provider observers remain unsupported. */
+  async removeObserver(id: string): Promise<void> {
+    if(this.supportsWorkspaceDelegation)await this.#delegatedObservers().removeObserver(id);
+  }
 
   /** Stages an MCP action for approval. */
   stageAction(toolName: string, args: Record<string, unknown>): StoredAction {

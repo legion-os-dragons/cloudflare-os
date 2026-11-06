@@ -145,6 +145,8 @@ function asLink(record: ShareKeyRecord | undefined): ShareLinkRecord | undefined
  * connected client.
  */
 export interface SharingCaller {
+  /** Supplied only by the authenticated deployment-admin management capability. */
+  isAdmin?: boolean;
   /** The caller's profile.id (username/email). */
   profileId: string;
   /**
@@ -167,7 +169,8 @@ export class SharingManager {
   constructor(
       private storage: SharingStorage,
       private ownerProfileId: string,
-      private ownerInvitesOnly: () => boolean) {}
+      private ownerInvitesOnly: () => boolean,
+      private isDeploymentAdmin: (profileId:string) => boolean = () => false) {}
 
   // Throw if share links are disabled by `ownerInvitesOnly`. Redemption refusals surface
   // from open(), so they carry the `shareLinksDisabled` open-gadget code; link management throws
@@ -326,7 +329,7 @@ export class SharingManager {
       throw new Error("Cannot add the workspace owner as a collaborator.");
     }
 
-    if (this.ownerInvitesOnly() && !opts.caller.isOwner) {
+    if (this.ownerInvitesOnly() && !opts.caller.isOwner && !opts.caller.isAdmin) {
       throw new Error(
           "Only the workspace owner can add people to a workspace that contains sensitive data.");
     }
@@ -340,6 +343,7 @@ export class SharingManager {
     let edge: PermissionEdge = {
       type: "user",
       sharer: opts.caller.profileId,
+      ...(opts.caller.isAdmin ? {authority:'deployment-admin' as const} : {}),
       created: new Date(),
       role: opts.role,
       note: opts.note,
@@ -352,6 +356,7 @@ export class SharingManager {
           e => e.type === "user" && e.sharer === opts.caller.profileId);
       if (existingEdge && existingEdge.type === "user") {
         existingEdge.role = maxRole(edgeGrantedRole(existingEdge), opts.role);
+        if (opts.caller.isAdmin) existingEdge.authority = 'deployment-admin';
         if (opts.note !== undefined) existingEdge.note = opts.note;
       } else {
         existing.addedBy.push(edge);
@@ -415,7 +420,7 @@ export class SharingManager {
 
     // Permission check: owner can remove anyone; collaborators can only remove users
     // they themselves added.
-    if (!caller.isOwner) {
+    if (!caller.isOwner && !(caller.isAdmin && this.isDeploymentAdmin(caller.profileId))) {
       let hasEdgeFromCaller = target.addedBy.some(
           e => e.type === "user" && e.sharer === caller.profileId);
       if (!hasEdgeFromCaller) {
@@ -427,7 +432,7 @@ export class SharingManager {
 
     // Sever the edges that grant the target access. The record is retained even if it becomes
     // empty, so the target's own outgoing grants survive and the removal can be undone.
-    if (caller.isOwner) {
+    if (caller.isOwner || caller.isAdmin && this.isDeploymentAdmin(caller.profileId)) {
       target.addedBy = [];
     } else {
       target.addedBy = target.addedBy.filter(
@@ -651,6 +656,8 @@ export class SharingManager {
             let creatorRole = sharerRole(info.creator);
             if (!creatorRole) continue;
             granted = minRole(info.role, creatorRole);
+          } else if (edge.authority === 'deployment-admin') {
+            if (this.isDeploymentAdmin(edge.sharer)) granted = edgeGrantedRole(edge);
           } else {
             // Skip the specifically-removed edge.
             if (removedEdge && id === removedEdge.target &&
@@ -680,7 +687,7 @@ export class SharingManager {
   // The caller's effective role, throwing if the caller has no access at all (which should not
   // happen for an authorized session).
   #requireCallerRole(caller: SharingCaller): CollaboratorRole {
-    if (caller.isOwner) return "build";
+    if (caller.isOwner || caller.isAdmin && this.isDeploymentAdmin(caller.profileId)) return "build";
     let role = this.computeEffectiveRoles().get(caller.profileId);
     if (!role) {
       throw new Error("You do not have permission to share this workspace.");

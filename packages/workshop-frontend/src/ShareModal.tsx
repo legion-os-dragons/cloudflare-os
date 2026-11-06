@@ -21,6 +21,7 @@ import { PersonAvatar } from './components/PersonAvatar'
 import { copyToClipboard } from './clipboard'
 import { isImeComposing } from './keyboardEvent'
 import { useServerConfig } from './ServerConfigContext'
+import {WorkspaceAccessPanel} from './features/workspace-access/WorkspaceAccessPanel'
 
 type CollaboratorRow =
   | { kind: 'owner'; profile: AiChatAuthorInfo }
@@ -276,8 +277,8 @@ function RecipientVerification({
       <div className="rounded-2xl border border-kumo-line/80 bg-kumo-base px-3 py-2.5">
         <p className="text-[12px] leading-[16px] tracking-[-0.15px] text-kumo-subtle">
           {role ? (
-            <>People with <span className="font-medium text-kumo-default">{roleLabel(role)}</span> access must</>
-          ) : 'Recipients must'} prove their own account can reach:
+            <>Connections used with <span className="font-medium text-kumo-default">{roleLabel(role)}</span> access.</>
+          ) : 'Connections used by this workspace.'} The workspace owner or an administrator can check and manage each person’s access.
         </p>
         <ul className="mt-1.5 max-h-32 space-y-1 overflow-y-auto">
           {requirements.map(requirement => (
@@ -340,6 +341,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
   const wasOpenRef = useRef(false)
   const userSearchEnabled = useServerConfig()?.userSearchEnabled ?? false
   const isOwner = !metadata.owner
+  const getWorkspaceAccess = useCallback(()=>overseer.getWorkspaceAccess(),[overseer])
   const containsRestrictedData = metadata.containsRestrictedData === true
   // The server refuses share links and non-owner invites once this is set; hide those controls.
   const ownerInvitesOnly = metadata.ownerInvitesOnly === true
@@ -1045,19 +1047,22 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               {ownerInvitesOnly ? (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
                   This workspace has read data from a connection that doesn’t allow share links, so
-                  only the owner can add people. People the owner invites are asked to verify their
-                  own access to the connections it uses at their access level — some may be unable to
-                  open it. Anything the workspace has already saved is visible to everyone who can.
+                  the owner or a deployment administrator must manage access. People also need
+                  connection access, managed in Connection access or through a provider account
+                  where required. Anything already saved is visible to everyone who can open it.
                 </p>
               ) : (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
-                  This workspace has read sensitive data. People you invite are asked to verify their
-                  own access to the connections it uses at their access level — some may be unable to
-                  open it. Anything the workspace has already saved is visible to everyone who can.
+                  This workspace has read sensitive data. People also need access to the connections
+                  it uses. Anything already saved is visible to everyone who can open it.
                 </p>
               )}
             </div>
           )}
+          {isOwner && <details className="my-3 rounded-xl border border-kumo-line p-3">
+            <summary className="cursor-pointer text-sm font-medium">Connection access</summary>
+            <WorkspaceAccessPanel key={collaborators.map(person=>person.profile.id+':'+person.role).join('|')} getManager={getWorkspaceAccess}/>
+          </details>}
           {canInvite && (
           <div className={`sticky top-0 z-10 bg-kumo-base pb-3 transition-shadow duration-200 ${scrolled ? 'themed-bottom-shadow border-b border-kumo-line/60' : ''}`}>
           <div

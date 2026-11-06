@@ -10,6 +10,7 @@ import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import { VendorAdminPanel } from './components/VendorAdminPanel'
+import {AdminWorkspaceAccessPanel} from './features/workspace-access/AdminWorkspaceAccessPanel'
 
 // Preset accent colors offered in the Theme section ('' = default brand).
 const ACCENT_PRESETS: { label: string; value: string }[] = [
@@ -435,10 +436,12 @@ export default function AdminPage() {
           { value: 'gatekeepers', label: 'Gatekeepers' },
           { value: 'formats', label: 'Formats' },
           { value: 'access', label: 'Access' },
+          { value: 'workspace-access', label: 'Workspace access' },
           ...vendorPages.map(page => ({ value: `vendor:${page.vendorId}`, label: page.title })),
         ]}
       />
 
+      {activeTab==='workspace-access'&&admin&&<AdminWorkspaceAccessPanel admin={admin.api}/>}
       {/* Pages contributed by gatekeeper vendors */}
       {admin && vendorPages.filter(page => activeTab === `vendor:${page.vendorId}`).map(page => (
         <VendorAdminPanel

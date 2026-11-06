@@ -13,6 +13,8 @@ import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { bundledBlueprintsManifestVersion, installBundledBlueprints } from './bundled-blueprints.js';
 import { BUNDLED_BLUEPRINTS } from './generated/bundled-blueprints.js';
+import type {OverseerDurableObject} from './overseer';
+import type {WorkspaceConnectionAccess} from '@gadgets/workshop-shared/api';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -615,12 +617,18 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
    * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
    * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string,private workspaces?:DurableObjectNamespace<OverseerDurableObject>) {
     super();
   }
 
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
+  }
+
+  async getWorkspaceAccess(workspaceId:string):Promise<WorkspaceConnectionAccess>{
+    if(!this.workspaces||!/^[a-f0-9]{64}$/.test(workspaceId))throw Error('Enter a valid workspace URL or ID.');
+    const result=await this.workspaces.get(this.workspaces.idFromString(workspaceId)).adminWorkspaceAccess(this.adminUserId);
+    return result as unknown as WorkspaceConnectionAccess;
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {

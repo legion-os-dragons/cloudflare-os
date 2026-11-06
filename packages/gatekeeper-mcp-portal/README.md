@@ -194,12 +194,12 @@ tier is `byo` unless a deployment sets `MCP_PORTAL_TRUST_ANNOTATIONS=true`. That
 "trusted server" assertion MCP's guidance asks for, and it has to be about the upstreams themselves,
 not just the portal in front of them.
 
-`addObserver` refuses everyone, as it does for user-supplied endpoints. Reaching the portal is not
-the same as being allowed to see a particular tool result, and the Gadget runs on the owner's
-credentials regardless. A sharper check is available here than for a bare endpoint —
-`portal_list_servers` is per-user and Access-filtered, so it could confirm a collaborator may reach
-the same server — but that is still server-granular, not record-granular. See
-[`sharing-policy.ts`](../mcp-shared/src/sharing-policy.ts).
+Provider-account `addObserver` still refuses: reaching the portal does not establish access to
+the owner's records. Workspace owners and deployment admins can instead explicitly delegate
+the exact existing endpoint/server/tool binding in native Connection access. The sealed native
+proof checks current workspace membership and that exact grant on admission and every read.
+Revocation excludes the observer from subsequent reads. Credentials remain in the owner's account
+object; the tool scope, write approvals and uncertain-write retry rules are unchanged.
 
 ## Notes and current limitations
 

@@ -1,7 +1,9 @@
 import { createMcpHandler } from "./incoming-mcp/transport.js";
 import { NativeMcpTools } from "./incoming-mcp/native-tools.js";
 import { AuthenticationError } from "./incoming-mcp/runtime.js";
-import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
+import { RpcStub, RpcTarget, RpcSession, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
+import { DurableObject } from 'cloudflare:workers';
+import { HttpRpcTransport } from './rpc-transport';
 import { validateRpc } from "capnweb-validate";
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import type { JWTPayload } from "jose";
@@ -81,11 +83,13 @@ type Env = Cloudflare.Env & {
   FLAGS?: Flagship;
 }
 
+type ApiContext = ExecutionContext | DurableObjectState;
+
 // =======================================================================================
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
-  constructor(private ctx: ExecutionContext, private env: Env,
+  constructor(private ctx: ApiContext, private env: Env,
       userId: DurableObjectId,
       private abortSession: (reason: Error) => void) {
     super();
@@ -679,7 +683,7 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
 class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
-  constructor(private ctx: ExecutionContext, private env: Env,
+  constructor(private ctx: ApiContext, private env: Env,
       private abortSession: (reason: Error) => void,
       private accessPayload?: JWTPayload) {
     super();
@@ -850,9 +854,94 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 }
 
+/** Own one RPC capability table while HTTP requests supply separate invocation budgets. */
+export class WorkshopConnection extends DurableObject<Env> {
+  private transport?: HttpRpcTransport;
+  private identity?: string;
+  private idleTimer?: ReturnType<typeof setTimeout>;
+
+  private caller(payload?: JWTPayload): string {
+    return JSON.stringify(payload ? { iss: payload.iss, sub: payload.sub, email: payload.email, aud: payload.aud } : null);
+  }
+
+  private touch(): void {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => this.transport?.abort(new Error('Workshop connection expired.')), 60_000);
+  }
+
+  /** Initialize an unguessable connection; application authentication remains in PublicApi. */
+  open(payload?: JWTPayload): void {
+    if (this.transport) throw new Error('Workshop connection already exists.');
+    this.identity = this.caller(payload);
+    const transport = this.transport = new HttpRpcTransport();
+    new RpcSession(transport, new PublicApiImpl(this.ctx, this.env, reason => transport.abort(reason), payload));
+    this.touch();
+  }
+
+  private authorized(payload?: JWTPayload): HttpRpcTransport {
+    if (!this.transport || this.identity !== this.caller(payload)) throw new Error('Workshop connection ended.');
+    this.touch();
+    return this.transport;
+  }
+
+  /** Deliver an ordered message once, in the invocation that received it. */
+  send(sequence: number, messages: string[], payload?: JWTPayload): void {
+    const transport = this.authorized(payload);
+    if (!Array.isArray(messages) || !messages.length || messages.length > 128 ||
+        messages.some(message => typeof message !== 'string')) throw new Error('Invalid Workshop message batch.');
+    messages.forEach((message, offset) => transport.accept(sequence + offset, message));
+  }
+
+  /** Read replies and callbacks with a bounded wait and explicit acknowledgement. */
+  receive(cursor: number, payload?: JWTPayload): Promise<{ cursor: number; messages: string[] }> {
+    return this.authorized(payload).read(cursor);
+  }
+
+  /** Release all capabilities associated with this browser connection. */
+  close(payload?: JWTPayload): void {
+    this.authorized(payload).abort(new Error('Workshop connection closed.'));
+    clearTimeout(this.idleTimer);
+  }
+}
+
+async function readRpcInput(req: Request): Promise<Record<string, unknown>> {
+  if (!req.body) return {};
+  const reader = req.body.getReader();
+  const decoder = new TextDecoder();
+  let size = 0, text = '';
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > 32 * 1024 * 1024) throw new Error('Workshop message is too large.');
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    text += decoder.decode();
+  } finally { await reader.cancel(); reader.releaseLock(); }
+  const value: unknown = JSON.parse(text);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Workshop message.');
+  return value as Record<string, unknown>;
+}
+
+function allowsRpcOrigin(req: Request, url: URL, env: Env): boolean {
+  const origin = req.headers.get('Origin');
+  return origin === url.origin || Boolean(env.DEV && origin && URL.canParse(origin) &&
+    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) && new URL(origin).hostname === url.hostname);
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     let url = new URL(req.url);
+
+    if (env.DEV && url.pathname === '/api' && req.method === 'OPTIONS' && allowsRpcOrigin(req, url, env)) {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': req.headers.get('Origin')!,
+        'Access-Control-Allow-Methods': 'POST',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Workshop-Rpc, X-Workshop-Connection',
+        'Vary': 'Origin',
+      } });
+    }
 
     if (url.pathname === SITE_LOGO_PATH) {
       return serveSiteLogo(req, env.BLUEPRINT_CONTENT);
@@ -911,6 +1000,44 @@ export default {
         }
 
         accessPayload = payload;
+      }
+
+      const rpcAction = req.headers.get('X-Workshop-Rpc');
+      if (rpcAction) {
+        if (url.pathname !== '/api' || req.method !== 'POST' ||
+            !allowsRpcOrigin(req, url, env)) {
+          return new Response('Invalid Workshop connection request.', { status: 403 });
+        }
+        const namespace = ctx.exports.WorkshopConnection;
+        const json = (value: unknown) => Response.json(value, { headers: {
+          'Cache-Control': 'no-store',
+          ...(env.DEV ? { 'Access-Control-Allow-Origin': req.headers.get('Origin')!, 'Vary': 'Origin' } : {}),
+        } });
+        try {
+          if (rpcAction === 'open') {
+            const id = namespace.newUniqueId();
+            await namespace.get(id).open(accessPayload);
+            return json({ connection: id.toString() });
+          }
+          const connection = req.headers.get('X-Workshop-Connection');
+          if (!connection || !/^[a-f0-9]{64}$/.test(connection)) return new Response('Invalid Workshop connection.', { status: 400 });
+          const session = namespace.get(namespace.idFromString(connection));
+          if (rpcAction === 'close') { await session.close(accessPayload); return json({}); }
+          const input = await readRpcInput(req);
+          if (rpcAction === 'send' && Number.isSafeInteger(input.sequence) && Array.isArray(input.messages) &&
+              input.messages.length > 0 && input.messages.length <= 128 && input.messages.every(message => typeof message === 'string')) {
+            await session.send(input.sequence as number, input.messages as string[], accessPayload);
+            return json({});
+          }
+          if (rpcAction === 'receive' && Number.isSafeInteger(input.cursor)) {
+            return json(await session.receive(input.cursor as number, accessPayload));
+          }
+          return new Response('Invalid Workshop connection operation.', { status: 400 });
+        } catch {
+          // Broken sessions are replaced by the existing shared reconnect handler. Application
+          // exceptions still travel through RPC; they never cause a write to be resubmitted.
+          return new Response('Workshop connection ended.', { status: 410 });
+        }
       }
 
       // HACK: Implement `abortSession` callback by closing the websocket.

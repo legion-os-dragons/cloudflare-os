@@ -1,7 +1,8 @@
 import { StrictMode, useState, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import { RouterProvider } from '@tanstack/react-router'
-import { RpcPromise, RpcStub, newWebSocketRpcSession } from 'capnweb'
+import { RpcPromise, RpcStub } from 'capnweb'
+import { connectWorkshop } from './rpcTransport'
 import { PublicApi, ServerConfig } from '@gadgets/workshop-shared/api'
 import { RpcContext } from './RpcContext'
 import { ServerConfigContext, ServerConfigErrorContext } from './ServerConfigContext'
@@ -45,11 +46,11 @@ async function devAutoLogin(stub: RpcStub<PublicApi>): Promise<void> {
   }
 }
 
-// WebSocket RPC connection management.
+// Shared RPC connection management.
 //
 // React's useEffect / useState machinery is kind of obnoxious in that, in dev mode, it runs
 // everything twice (runs once, immediately cleans up, then runs again). This isn't so good for
-// our WebSocket as it means we are creating redundant connections to the server and throwing
+// our connection as it means we are creating redundant connections to the server and throwing
 // them away instantly. It gets even worse when we start trying to handle disconnects gracefully:
 // we can end up with two connections that are fighting to replace each other.
 //
@@ -86,8 +87,7 @@ const withTimeout = <T,>(promise: Promise<T>, ms: number): Promise<T> => {
 function startConnection(): RpcStub<PublicApi> {
   lastConnectTime = Date.now();
   const apiHost = getBackendHost();
-  const wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + apiHost + '/api';
-  const stub = newWebSocketRpcSession<PublicApi>(wsUrl);
+  const stub = connectWorkshop(window.location.protocol + '//' + apiHost + '/api');
   stub.onRpcBroken(handleBroken);
   return stub;
 }

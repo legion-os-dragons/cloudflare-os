@@ -4,10 +4,8 @@ import { GadgetDictationSession } from './features/gadgets/dictationSession'
 import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
-import { RpcStub, RpcTarget, newMessagePortRpcSession, newHttpBatchRpcSession } from 'capnweb'
-import { GadgetClient, ConsoleLogEvent, type PublicApi } from '@gadgets/workshop-shared/api'
-import { CF_ACCESS_MODE } from './useAuth'
-import { getBackendHost } from './connectHandoff'
+import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
+import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
 import { GadgetDeviceState, type DeviceStateScope } from './features/gadgets/deviceState'
 import { GadgetFileActions } from './features/gadgets/fileActions'
 import { GadgetAccessSession } from './features/gadgets/accessSession'
@@ -158,24 +156,6 @@ const READ_RECONNECT_TIMEOUT_MS = 10_000
 // Only metadata reads: financial updates, submissions and approvals must never be replayed.
 // UI chunks are immutable, digest-checked code reads; retrying them cannot replay a CRM write.
 const RECOVERABLE_STATUS_READS = new Set(['documentCatalog', 'documentIntakeStatus', 'documentRefreshStatus', 'feedCursors', 'uiAssetChunk'])
-
-// Native apps continuously read streams and poll their original APIs. Keeping those calls on
-// the page's WebSocket makes them share one Worker invocation's subrequest budget for its entire
-// lifetime. Each JSON transport operation instead uses one authenticated HTTP batch. Reopening
-// follows the same workspace/gadget authorization; it never retries a submitted operation.
-const BOUNDED_NATIVE_CALLS = new Set(['workspace', 'nativeResponse', 'nativeCancel', 'nativeUploadBegin', 'nativeUploadChunk'])
-async function nativeHttpCall(scope: DeviceStateScope, chatId: number | undefined,
-    method: string, args: unknown[]): Promise<any> {
-  using api = newHttpBatchRpcSession<PublicApi>(`${window.location.protocol}//${getBackendHost()}/api`)
-  const token = localStorage.getItem('authToken')
-  if (!CF_ACCESS_MODE && !token) throw new Error('Sign in before opening this application.')
-  const user = CF_ACCESS_MODE ? api.authenticateFromCfAccess() : api.authenticate(token!)
-  const workspace = user.openGadget(scope.workspaceId!)
-  const client = workspace.getGadget(scope.gadgetId)
-  if (method === 'nativeRequest') return await client.dispatchRequest(args[0] as GadgetCapabilityJson, chatId)
-  const target: any = client.connectToGadget(chatId)
-  return await target[method](...args)
-}
 
 export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={`${props.chatId}:${props.deviceStateScope?.userId ?? ""}:${props.deviceStateScope?.workspaceId ?? ""}:${props.deviceStateScope?.gadgetId ?? ""}`} {...props} />
@@ -538,11 +518,6 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               }
               if (property === 'nativeRequest') return async (request: GadgetCapabilityJson) => {
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
-                if (auth && deviceStateScope?.workspaceId) {
-                  const result = await nativeHttpCall(deviceStateScope, chatId, 'nativeRequest', [request])
-                  if (!isCurrent()) throw new Error('Gadget session has ended.')
-                  return result
-                }
                 if (pendingGadgetStubRef.current) await recoverStatusRead(gadgetStubRef.current)
                 if (!isCurrent()) throw new Error('Gadget session has ended.')
                 const client = gadgetRef.current
@@ -564,14 +539,6 @@ function GadgetUISession({ gadget, deviceStateScope, height, reloadTrigger, isVi
               if (property === 'workshopDictation') return dictationSession
               if (property === 'workshopAccess') return accessSession
               if (property === 'workshopConnections') return connectionsSession
-              if (typeof property === 'string' && BOUNDED_NATIVE_CALLS.has(property) && auth && deviceStateScope?.workspaceId) {
-                return async (...args: unknown[]) => {
-                  if (!isCurrent()) throw new Error('Gadget session has ended.')
-                  const result = await nativeHttpCall(deviceStateScope, chatId, property, args)
-                  if (!isCurrent()) throw new Error('Gadget session has ended.')
-                  return result
-                }
-              }
               if (typeof property === 'symbol' || property in target) {
                 return Reflect.get(target, property, receiver)
               }

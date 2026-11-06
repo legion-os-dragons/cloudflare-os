@@ -277,8 +277,8 @@ function RecipientVerification({
       <div className="rounded-2xl border border-kumo-line/80 bg-kumo-base px-3 py-2.5">
         <p className="text-[12px] leading-[16px] tracking-[-0.15px] text-kumo-subtle">
           {role ? (
-            <>People with <span className="font-medium text-kumo-default">{roleLabel(role)}</span> access must</>
-          ) : 'Recipients need'} access to these connections. Owners can grant supported connections below; other services require the recipient’s own account:
+            <>Connections used with <span className="font-medium text-kumo-default">{roleLabel(role)}</span> access.</>
+          ) : 'Connections used by this workspace.'} The workspace owner or an administrator can check and manage each person’s access.
         </p>
         <ul className="mt-1.5 max-h-32 space-y-1 overflow-y-auto">
           {requirements.map(requirement => (
@@ -1048,8 +1048,8 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
                   This workspace has read data from a connection that doesn’t allow share links, so
                   the owner or a deployment administrator must manage access. People also need
-                  connection access, granted below where supported, or verified through their own
-                  provider account. Anything already saved is visible to everyone who can open it.
+                  connection access, managed in Connection access or through a provider account
+                  where required. Anything already saved is visible to everyone who can open it.
                 </p>
               ) : (
                 <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">

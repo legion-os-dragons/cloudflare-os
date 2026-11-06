@@ -200,7 +200,7 @@ export const WorkspaceAccessPanel = ({ getManager, managePeople = false }: Props
                             ? "Access granted"
                             : connection.delegatable
                               ? "Not granted"
-                              : "Requires this person’s own provider account"}
+                              : "Provider-managed access"}
                         </p>
                       </div>
                       {connection.delegatable && (

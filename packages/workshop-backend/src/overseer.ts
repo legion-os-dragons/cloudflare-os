@@ -10577,7 +10577,7 @@ export class Gadget extends AuthoredGadget {
     const connection=this.storage.gatekeepers.get(connectionId);
     if(!connection)throw Error('This connection no longer exists.');
     const description=await this.getGatekeeperFacet(connectionId).describe();
-    if(!description.workspaceDelegation||!connection.resourceUrl)throw Error('This provider requires the recipient’s own account and does not support owner delegation.');
+    if(!description.workspaceDelegation||!connection.resourceUrl)throw Error('This connection cannot be delegated here; its provider access policy still applies.');
     const sharing=await this.getSharingManager();
     if(allowed&&!sharing.getEffectiveRole(profileId))throw Error('Invite this person to the workspace first.');
     if(profileId===await this.getOwnerProfileId())throw Error('The owner already controls this connection.');

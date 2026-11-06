@@ -228,7 +228,7 @@ export type ResourceDescription = {
    */
   tsType: string;
 
-  /** The binding can verify a native owner delegation without a collaborator account. */
+  /** This binding uses explicit native owner/admin grants for collaborator access. */
   workspaceDelegation?: true;
 
   /** Indicates that getSlashCommandProvider() is available. */
@@ -260,8 +260,9 @@ export type SupportedResource = {
   icon?: AvatarImage;
 
   /**
-   * Display-only notice that this resource rejects every collaborator observer.
-   * The UI must not offer account setup as a remedy. addObserver remains authoritative.
+   * Collaborator policy. Owner-only resources reject all collaborators; owner-delegated
+   * resources use explicit native grants instead of a separate provider account.
+   * The gatekeeper's admission methods remain authoritative.
    */
   observerAccess?: "owner-only" | "owner-delegated";
 

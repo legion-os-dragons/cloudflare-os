@@ -1075,6 +1075,8 @@ export interface WorkspaceConnectionAccess extends RpcTarget {
   setConnectionAccess(profileId:string, connectionId:number, allowed:boolean, expectedRevision:number):Promise<WorkspaceConnectionAccessView>;
   invitePerson(email:string, role:CollaboratorRole):Promise<WorkspaceConnectionAccessView>;
   removePerson(profileId:string):Promise<WorkspaceConnectionAccessView>;
+  /** Run the same connection admission checks used when this member opens the workspace. */
+  checkPersonAccess(profileId:string):Promise<{ready:boolean;message:string}>;
 }
 
 export interface AdminApi {

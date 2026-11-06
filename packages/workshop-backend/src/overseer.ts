@@ -11376,6 +11376,16 @@ class WorkspaceConnectionAccessImpl extends RpcTarget implements WorkspaceConnec
     if(affected.length)this.impl.scheduleAccessRestart('Workspace restarted to revoke member access.');
     return this.impl.connectionAccessView();
   }
+  async checkPersonAccess(profileId:string):Promise<{ready:boolean;message:string}>{
+    await this.#check();
+    const role=(await this.impl.getSharingManager()).getEffectiveRole(profileId);
+    if(!role)throw Error('This person is not a workspace member.');
+    const user=this.impl.users.getByName(profileId),profile=await user.whoamiIfExists();
+    if(!profile||profile.id!==profileId)throw Error('This person’s existing account could not be verified.');
+    await this.#check();
+    try{await this.impl.ensureObserver(profileId,user,role);return{ready:true,message:'Workspace membership and all required connection checks passed.'};}
+    catch(error){return{ready:false,message:error instanceof Error?error.message:'Connection access could not be confirmed.'};}
+  }
 }
 
 type WorkspaceConnectionGrantProofProps={overseerId:string;gatekeeperId:number;profileId:string};

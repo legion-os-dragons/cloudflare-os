@@ -74,6 +74,13 @@ export const WorkspaceAccessPanel=({getManager,managePeople=false}:Props)=>{
         {!view.connections.length&&<p className="my-2 text-sm">This workspace has no account-requiring connections.</p>}
         <div className="mt-3 flex flex-wrap gap-2">
           <WorkshopButton type="button" disabled={busy||!view.connections.some(item=>item.delegatable&&!item.grantedTo.includes(person))} onClick={()=>void grantAll()}>Grant supported connections</WorkshopButton>
+          <WorkshopButton type="button" disabled={busy||!manager} onClick={async()=>{
+            if(!manager)return
+            setBusy(true);setError('');setNotice('')
+            try{const result=await manager.api.checkPersonAccess(person);if(result.ready)setNotice(result.message);else setError(result.message)}
+            catch(cause){setError(cause instanceof Error?cause.message:'Access could not be checked.')}
+            finally{setBusy(false)}
+          }}>Check access</WorkshopButton>
           {managePeople&&<WorkshopButton type="button" disabled={busy} onClick={()=>setConfirmRemove(true)}>Remove workspace access</WorkshopButton>}
         </div>
         {confirmRemove&&<div role="group" aria-label="Confirm removing workspace access" className="mt-3 rounded-lg border border-kumo-line p-3"><p className="mb-2 text-sm">Remove {person} from this workspace and revoke their connection grants?</p><WorkshopButton disabled={busy} onClick={()=>{if(manager)void act(()=>manager.api.removePerson(person),'Workspace access removed.')}}>Confirm removal</WorkshopButton><WorkshopButton disabled={busy} onClick={()=>setConfirmRemove(false)}>Cancel</WorkshopButton></div>}

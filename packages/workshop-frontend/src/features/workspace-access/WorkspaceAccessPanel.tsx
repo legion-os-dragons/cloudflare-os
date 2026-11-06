@@ -18,13 +18,15 @@ export const WorkspaceAccessPanel=({getManager,managePeople=false}:Props)=>{
   useEffect(()=>{
     let cancelled=false
     let held:RpcStub<WorkspaceConnectionAccess>|undefined
-    setView(null);setError('')
+    const release=()=>{held?.[Symbol.dispose]();held=undefined}
+    setManager(null);setView(null);setError('')
     void getManager().then(async api=>{
       held=api
+      if(cancelled){release();return}
       const next=await api.getView()
       if(!cancelled){setManager({api});setView(next);setPerson(next.people[0]?.profile.id??'')}
     }).catch(cause=>{if(!cancelled)setError(cause instanceof Error?cause.message:'Access settings could not be loaded.')})
-    return()=>{cancelled=true;held?.[Symbol.dispose]()}
+    return()=>{cancelled=true;release()}
   },[getManager])
   const act=async(operation:()=>Promise<WorkspaceConnectionAccessView>,message:string)=>{
     setBusy(true);setError('');setNotice('')

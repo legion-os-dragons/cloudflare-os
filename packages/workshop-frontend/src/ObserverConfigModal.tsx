@@ -331,7 +331,7 @@ export default function ObserverConfigModal({
         </Dialog.Title>
         <Text variant="secondary" size="sm" as="p">
           {hasPrivateConnections
-            ? 'Some services connected here do not support shared access. Their owner must provide a shareable view before you can open this workspace.'
+            ? 'The services below block shared access to this workspace. The workspace owner must resolve their access requirements. Signing into other services will not resolve this block.'
             : isRetry
             ? 'We couldn’t confirm your access to everything this workspace has read. Depending on ' +
               'the reason below, re-authenticate an expired account, choose a different one, or ask ' +
@@ -346,7 +346,7 @@ export default function ObserverConfigModal({
           </div>
         ) : (
           <div className="flex flex-col gap-4 mt-5">
-            {[...groups.values()].map(group => {
+            {[...groups.values()].filter(group => !hasPrivateConnections || ownerOnly(group[0])).map(group => {
               const need = group[0]
               const privateConnection = ownerOnly(need)
               const matching = [...accounts.values()].filter(a => a.vendorId === need.vendorId)

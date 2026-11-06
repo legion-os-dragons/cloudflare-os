@@ -10309,8 +10309,9 @@ export class Gadget extends AuthoredGadget {
       const delegated = new Set<number>();
       for (const gk of inScope) {
         const facet = this.getGatekeeperFacet(gk.id);
-        if (!(await facet.describe()).workspaceDelegation) continue;
-        if (!await this.hasConnectionAccess(profileId,gk.id,gk.resourceUrl??''))
+        const admission=await facet.describe();
+        if (!admission.workspaceDelegation&&!admission.workspaceMemberObservation) continue;
+        if (!admission.workspaceMemberObservation&&!await this.hasConnectionAccess(profileId,gk.id,gk.resourceUrl??''))
           throw new Error(`The workspace owner or an administrator must grant your account access to ${observerBindingTitle(gk)} in Share → Connection access.`);
         const proof=this.ctx.exports.WorkspaceConnectionGrantProof({props:{overseerId:this.ctx.id.toString(),gatekeeperId:gk.id,profileId}});
         const delegatedFacet=facet as Fetcher<Gatekeeper<any>&Required<Pick<Gatekeeper<any>,'addWorkspaceObserver'>>>;
@@ -10352,7 +10353,7 @@ export class Gadget extends AuthoredGadget {
             // Non-interactive open (e.g. no UI). We can't configure, so deny.
             throw new Error(
                 "To open this workspace, you must choose connected accounts for the services it " +
-                "uses, but no configuration channel was provided.");
+                `uses: ${uncovered.map(observerBindingTitle).join(', ')}. Open its connection setup to choose accounts.`);
           }
 
           let needs: ObserverBindingNeed[] = uncovered.map(gk => ({
@@ -10560,6 +10561,7 @@ export class Gadget extends AuthoredGadget {
       const description=await this.getGatekeeperFacet(record.id).describe();
       return{id:record.id,title:observerBindingTitle(record),resourceUrl:record.resourceUrl??description.url,
         delegatable:description.workspaceDelegation===true,
+        workspaceMembers:description.workspaceMemberObservation===true,
         grantedTo:grants.filter(grant=>grant.gatekeeperId===record.id&&grant.resourceUrl===record.resourceUrl).map(grant=>grant.profileId)};
     }));
     return{workspaceId:this.ctx.id.toString(),ownerProfileId,people,connections,

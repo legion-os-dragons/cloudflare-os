@@ -230,6 +230,8 @@ export type ResourceDescription = {
 
   /** This binding uses explicit native owner/admin grants for collaborator access. */
   workspaceDelegation?: true;
+  /** Producer accepts every current workspace member, without a provider account choice. */
+  workspaceMemberObservation?: true;
 
   /** Indicates that getSlashCommandProvider() is available. */
   hasSlashCommands?: true;

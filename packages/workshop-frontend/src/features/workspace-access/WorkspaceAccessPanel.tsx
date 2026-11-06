@@ -196,7 +196,9 @@ export const WorkspaceAccessPanel = ({ getManager, managePeople = false }: Props
                           {connection.resourceUrl}
                         </p>
                         <p className="text-xs">
-                          {allowed
+                          {connection.workspaceMembers
+                            ? "Available to workspace members"
+                            : allowed
                             ? "Access granted"
                             : connection.delegatable
                               ? "Not granted"

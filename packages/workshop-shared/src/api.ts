@@ -1065,7 +1065,7 @@ export type WorkspaceConnectionAccessView = {
   ownerProfileId: string;
   revision: number;
   people: CollaboratorInfo[];
-  connections: {id:number;title:string;resourceUrl:string;delegatable:boolean;grantedTo:string[]}[];
+  connections: {id:number;title:string;resourceUrl:string;delegatable:boolean;workspaceMembers:boolean;grantedTo:string[]}[];
   audit: {id:string;at:string;actor:string;action:string;profileId:string;connectionId:number|null}[];
 };
 

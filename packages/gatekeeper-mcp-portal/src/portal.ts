@@ -305,7 +305,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
    */
   async getSupportedResources(): Promise<SupportedResource[]> {
     const config = readPortalConfig(this.env);
-    return config ? [portalResource(config)] : [];
+    return config ? [{...portalResource(config),observerAccess:'owner-delegated'}] : [];
   }
 
   async getTypeScriptTypes(): Promise<string> {
@@ -538,6 +538,8 @@ type McpGatekeeperImplProps = {
 export class McpGatekeeperImpl
   extends McpFacetBase<Env, McpGatekeeperImplProps, McpSessionImpl> {
 
+  protected override get supportsWorkspaceDelegation(): boolean { return true; }
+
   protected get log() {
     return logger.with({
       serverId: this.ctx.props.serverId,
@@ -586,6 +588,7 @@ export class McpGatekeeperImpl
 
     return {
       url: this.resourceUrl,
+      workspaceDelegation: true,
       title: scope.tools?.length === 1 ? `${label}: ${scope.tools[0]}` : label,
       snippet,
       suggestedBindingName: `MCP_${bindingNameFragment(this.#bindingId())}`,

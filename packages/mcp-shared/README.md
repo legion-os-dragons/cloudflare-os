@@ -70,8 +70,10 @@ Annotations are optional in MCP and most servers publish none. Every hint is com
 auto-apply, on either tier. That matches the spec's own defaults (`readOnlyHint: false`,
 `destructiveHint: true`, `idempotentHint: false`).
 
-Neither tier can be shared. A Gadget bound to any MCP endpoint is owner-only, for reasons unrelated
-to provenance — see [`sharing-policy.ts`](src/sharing-policy.ts).
+Provider-account observation remains owner-only, regardless of tier. A connector may opt into
+explicit native workspace delegation of its exact scoped binding; the portal connector does so.
+The shared facet and session then use the same live grant proof and per-read observation gate as
+other delegated connectors. Bare user-supplied MCP endpoints retain the owner-only policy.
 
 What an account records instead of a tier is `provenance`, `"user"` or `"deployment"`, settled when
 it connects. Provenance decides whether a server may rename itself over an administrator's chosen

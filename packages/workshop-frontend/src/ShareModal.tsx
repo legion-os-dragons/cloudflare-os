@@ -1059,7 +1059,10 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               )}
             </div>
           )}
-          {isOwner && <WorkspaceAccessPanel key={collaborators.map(person=>person.profile.id+':'+person.role).join('|')} getManager={getWorkspaceAccess}/>}
+          {isOwner && <details className="my-3 rounded-xl border border-kumo-line p-3">
+            <summary className="cursor-pointer text-sm font-medium">Connection access</summary>
+            <WorkspaceAccessPanel key={collaborators.map(person=>person.profile.id+':'+person.role).join('|')} getManager={getWorkspaceAccess}/>
+          </details>}
           {canInvite && (
           <div className={`sticky top-0 z-10 bg-kumo-base pb-3 transition-shadow duration-200 ${scrolled ? 'themed-bottom-shadow border-b border-kumo-line/60' : ''}`}>
           <div

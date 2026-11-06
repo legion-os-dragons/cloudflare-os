@@ -1,3 +1,4 @@
+import { readConnectForm } from "@gadgets/gatekeeper-kit/connect-pages";
 // The MCP gatekeeper: connects any Model Context Protocol server as a Gadgets capability.
 //
 // Every call is either an observation or an approval-gated action, `readOnlyHint` decides which,
@@ -114,7 +115,8 @@ export default {
           }
           return htmlResponse(connectFormHtml(path));
         }
-        const form = await request.formData();
+        const form = await readConnectForm(request);
+        if (form instanceof Response) return form;
         return continueConnect(
           account, initiationNonce, String(form.get("url") ?? ""), env, path);
       },

@@ -10,6 +10,7 @@
     "test:run": "vitest run"
   },
   "dependencies": {
+    "@gadgets/gatekeeper-kit": "workspace:*",
     "@gadgets/configurator-ui": "workspace:*",
     "@gadgets/mcp-shared": "workspace:*",
     "@gadgets/observability": "workspace:*",

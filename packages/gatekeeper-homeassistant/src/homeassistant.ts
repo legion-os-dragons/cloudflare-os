@@ -1,3 +1,4 @@
+import { readConnectForm } from "@gadgets/gatekeeper-kit/connect-pages";
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
@@ -291,7 +292,9 @@ export default {
       if (req.method === "POST") {
         let formData: FormData;
         try {
-          formData = await req.formData();
+          const parsed = await readConnectForm(req);
+          if (parsed instanceof Response) return parsed;
+          formData = parsed;
         } catch {
           return new Response("Invalid form submission.", { status: 400 });
         }

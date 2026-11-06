@@ -2,6 +2,33 @@
 
 import type { ConnectHandoff } from "@gadgets/workshop-shared/gatekeeper";
 
+/** Read a credential setup form without letting multipart parsing buffer an unbounded request. */
+export async function readConnectForm(request: Request): Promise<FormData | Response> {
+  const reader = request.body?.getReader();
+  if (!reader) return new FormData();
+  const parts: ArrayBuffer[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > 64 * 1024) return new Response('Connection form is too large.', { status: 413 });
+      parts.push(new Uint8Array(chunk.value).buffer);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  try {
+    return await new Response(new Blob(parts), {
+      headers: { 'Content-Type': request.headers.get('Content-Type') ?? '' },
+    }).formData();
+  } catch {
+    return new Response('Invalid connection form.', { status: 400 });
+  }
+}
+
 const HTML_ESCAPES: Readonly<Record<string, string>> = {
   "&": "&amp;",
   "<": "&lt;",

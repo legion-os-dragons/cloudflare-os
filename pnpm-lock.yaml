@@ -556,6 +556,9 @@ importers:
 
   packages/gatekeeper-mcp:
     dependencies:
+      '@gadgets/gatekeeper-kit':
+        specifier: workspace:*
+        version: link:../gatekeeper-kit
       '@gadgets/configurator-ui':
         specifier: workspace:*
         version: link:../configurator-ui

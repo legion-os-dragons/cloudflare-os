@@ -16,8 +16,8 @@ import type { GadgetCapabilityJson, GadgetCapabilitySpec } from "./gadget-capabi
 // which essentially allows natural JavaScript / TypeScript interfaces to be exposed over the
 // network.
 //
-// The RPC interface operates over a WebSocket, which the client starts immediately at startup and
-// keeps open for the entire lifetime of the session, reconnecting if needed.
+// One capability session survives across bounded HTTP messages. Its Durable Object owns callbacks
+// and references; a page does not retain one Worker invocation's I/O budget for its lifetime.
 //
 // Gadgets run inside a sandboxed iframe which has no ability to talk to the outside world at all,
 // except postMessage() to the parent frame. Through postMessage() exchanges, the Gadget can speak
@@ -65,6 +65,13 @@ export interface LoginAttempt extends RpcTarget {
    */
   receive(): Promise<string | null>;
 }
+
+/** Largest RPC message in UTF-8, including JSON escaping; large files and exports use chunk APIs. */
+export const WORKSHOP_RPC_MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+/** Combined queued input/output bytes for one connection, bounded below Worker isolate memory. */
+export const WORKSHOP_RPC_MAX_QUEUE_BYTES = 16 * 1024 * 1024;
+/** Largest JSON HTTP envelope, including escaping of its bounded RPC messages. */
+export const WORKSHOP_RPC_MAX_HTTP_BYTES = 16 * 1024 * 1024;
 
 /** Public API exposed to the internet. */
 export interface PublicApi extends RpcTarget {

@@ -1,4 +1,5 @@
-import { DEFAULT_LIMITS, type RpcTransport } from 'capnweb';
+import type { RpcTransport } from 'capnweb';
+import { WORKSHOP_RPC_MAX_MESSAGE_BYTES, WORKSHOP_RPC_MAX_QUEUE_BYTES } from '@gadgets/workshop-shared/api';
 
 /** Message transport for one connection; the owner delivers each message in a fresh request. */
 export class HttpRpcTransport implements RpcTransport {
@@ -15,13 +16,14 @@ export class HttpRpcTransport implements RpcTransport {
   /** Publish a reply or callback without tying it to the request that created the connection. */
   send(message: string): void {
     if (this.failure) throw this.failure;
-    if (message.length > DEFAULT_LIMITS.maxMessageSize ||
-        this.outgoingSize + message.length > DEFAULT_LIMITS.maxMessageSize * 2 || this.outgoing.length >= 128) {
+    const size = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+    if (size > WORKSHOP_RPC_MAX_MESSAGE_BYTES ||
+        this.incomingSize + this.outgoingSize + size > WORKSHOP_RPC_MAX_QUEUE_BYTES - 256 || this.outgoing.length >= 128) {
       this.abort(new Error('Workshop connection reply queue is full.'));
       throw this.failure;
     }
     this.outgoing.push(message);
-    this.outgoingSize += message.length;
+    this.outgoingSize += size;
     this.poll?.();
   }
 
@@ -29,16 +31,17 @@ export class HttpRpcTransport implements RpcTransport {
   receive(): Promise<string> {
     if (this.failure) return Promise.reject(this.failure);
     const message = this.incoming.shift();
-    if (message !== undefined) { this.incomingSize -= message.length; return Promise.resolve(message); }
+    if (message !== undefined) { this.incomingSize -= new TextEncoder().encode(JSON.stringify(message)).byteLength; return Promise.resolve(message); }
     return new Promise((resolve, reject) => { this.receiver = { resolve, reject }; });
   }
 
   /** Admit each ordered client message once; a transport failure never replays application work. */
   accept(sequence: number, message: string): void {
     if (this.failure) throw this.failure;
+    const size = typeof message === 'string' ? new TextEncoder().encode(JSON.stringify(message)).byteLength : Infinity;
     if (sequence !== this.nextSequence || typeof message !== 'string' ||
-        message.length > DEFAULT_LIMITS.maxMessageSize ||
-        this.incomingSize + message.length > DEFAULT_LIMITS.maxMessageSize * 2 || this.incoming.length >= 128) {
+        size > WORKSHOP_RPC_MAX_MESSAGE_BYTES ||
+        this.incomingSize + this.outgoingSize + size > WORKSHOP_RPC_MAX_QUEUE_BYTES - 256 || this.incoming.length >= 128) {
       this.abort(new Error('Invalid Workshop connection message.'));
       throw this.failure;
     }
@@ -47,7 +50,7 @@ export class HttpRpcTransport implements RpcTransport {
       const receiver = this.receiver;
       this.receiver = undefined;
       receiver.resolve(message);
-    } else { this.incoming.push(message); this.incomingSize += message.length; }
+    } else { this.incoming.push(message); this.incomingSize += size; }
   }
 
   /** Return unacknowledged replies; a lost read response does not lose a capability or result. */
@@ -58,7 +61,7 @@ export class HttpRpcTransport implements RpcTransport {
       throw new Error('Invalid Workshop connection cursor.');
     }
     const acknowledged = this.outgoing.splice(0, cursor - this.acknowledged);
-    this.outgoingSize -= acknowledged.reduce((size, message) => size + message.length, 0);
+    this.outgoingSize -= acknowledged.reduce((size, message) => size + new TextEncoder().encode(JSON.stringify(message)).byteLength, 0);
     this.acknowledged = cursor;
     if (!this.outgoing.length) {
       let timer: ReturnType<typeof setTimeout> | undefined;

@@ -5869,7 +5869,8 @@ export class Gadget extends AuthoredGadget {
     const jsCode = packaged ?? files.get('client.js');
     if (jsCode !== undefined && typeof jsCode !== 'string') throw Error('Invalid UI module.');
     if(jsCode===undefined)return null;
-    return jsCode.length>8*1024*1024?{jsCode:'',source:new Blob([jsCode]).stream()}:{jsCode};
+    // Keep source out of escaped RPC envelopes; the existing stream capability carries large UIs.
+    return jsCode.length>128*1024?{jsCode:'',source:new Blob([jsCode]).stream()}:{jsCode};
   }
 
   async getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number)
@@ -11713,7 +11714,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.#leaveSession();
     this.#leavePresence();
     this.#leaveOutputsFanout();
-    this.notifyClosed();
+    // The client capability may already be gone when its connection is being disposed.
+    void this.notifyClosed().catch(() => {});
     this.notifyClosed[Symbol.dispose]();
   }
 
@@ -13387,7 +13389,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#leaveSession();
     this.#leavePresence();
     this.#leaveOutputsFanout();
-    this.notifyClosed();
+    // The client capability may already be gone when its connection is being disposed.
+    void this.notifyClosed().catch(() => {});
     this.notifyClosed[Symbol.dispose]();
   }
 

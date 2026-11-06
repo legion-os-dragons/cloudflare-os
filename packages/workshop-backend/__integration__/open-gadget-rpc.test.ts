@@ -4,7 +4,7 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { newWebSocketRpcSession, type RpcStub } from "capnweb";
+import { connectWorkshop, type RpcStub } from "../../workshop-frontend/src/rpcTransport";
 import {
   createOpenGadgetError,
   getOpenGadgetErrorCode,
@@ -54,18 +54,11 @@ function expectRpcCode(error: CodedError, code: OpenGadgetErrorCode): void {
 }
 
 async function connect(): Promise<RpcStub<PublicApi>> {
-  // A service-binding fetch context ends with the upgrade response, before the socket callbacks.
-  // Invoke the handler directly so the WebSocket session shares the test's execution context.
-  const response = await server.fetch(new Request("https://workshop.invalid/api", {
-    headers: { Upgrade: "websocket" },
-  }), env, createExecutionContext());
-
-  expect(response.status).toBe(101);
-  const socket = response.webSocket;
-  if (!socket) throw new TypeError("Expected a WebSocket response.");
-
-  socket.accept();
-  return newWebSocketRpcSession<PublicApi>(socket);
+  return connectWorkshop("https://workshop.invalid/api", async (input, init) => {
+    const request = new Request(input, init);
+    request.headers.set('Origin', 'https://workshop.invalid');
+    return server.fetch(request, env, createExecutionContext());
+  });
 }
 
 async function createAccount(
@@ -171,9 +164,12 @@ describe("user-DO reset flags", () => {
 
     await abortAllDurableObjects();
 
-    // The session recovers: AuthenticatedApiImpl resolves a fresh stub per call, so the
-    // restarted object serves this read — the browser never sees the reset.
-    expect(await authenticated.listModels()).toBeInstanceOf(Array);
+    // A reset of every DO also ends the connection's capability table. The browser reconnects
+    // and authenticates again; calls with an ambiguous outcome are never replayed.
+    await expect(authenticated.listModels()).rejects.toThrow();
+    using reopened = await connect();
+    using reauthenticated = await reopened.authenticate(account.token);
+    expect(await reauthenticated.listModels()).toBeInstanceOf(Array);
 
     const nativeErr = await rejection(userStub.listModels());
     expect({
@@ -198,7 +194,7 @@ describe("user-DO reset flags", () => {
 // workspace (Overseer) DO keeps running. The Overseer used to mint its owner/clientUser stubs
 // once at open(); after the user DO's incarnation died, every user-DO-carrying call on the
 // still-open session — newChat, listModels, createGadget, setPinned — failed against the
-// poisoned stub until the WebSocket reconnected. The session capabilities now mint a fresh stub
+// poisoned stub until the browser reconnected. The session capabilities now mint a fresh stub
 // per call, so the first post-reset call simply restarts the object — no reset flags needed,
 // which is also why this is testable despite local aborts rejecting flagless (see above).
 // abortAllDurableObjects() can't produce the asymmetry (it kills the Overseer too), so the

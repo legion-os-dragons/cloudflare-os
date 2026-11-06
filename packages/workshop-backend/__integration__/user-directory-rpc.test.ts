@@ -1,19 +1,16 @@
 import { createExecutionContext } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { newWebSocketRpcSession, type RpcStub } from "capnweb";
+import { connectWorkshop, type RpcStub } from "../../workshop-frontend/src/rpcTransport";
 import type { PublicApi } from "@gadgets/workshop-shared/api";
 import { expect, it, vi } from "vitest";
 import server from "../src/server";
 
 async function connect(): Promise<RpcStub<PublicApi>> {
-  const response = await server.fetch(new Request("https://workshop.invalid/api", {
-    headers: { Upgrade: "websocket" },
-  }), env, createExecutionContext());
-  expect(response.status).toBe(101);
-  const socket = response.webSocket;
-  if (!socket) throw new TypeError("Expected a WebSocket response.");
-  socket.accept();
-  return newWebSocketRpcSession<PublicApi>(socket);
+  return connectWorkshop("https://workshop.invalid/api", async (input, init) => {
+    const request = new Request(input, init);
+    request.headers.set('Origin', 'https://workshop.invalid');
+    return server.fetch(request, env, createExecutionContext());
+  });
 }
 
 async function authenticate(publicApi: RpcStub<PublicApi>, prefix: string, displayName: string) {

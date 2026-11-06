@@ -1,7 +1,7 @@
-// Drives the Workshop over its real Cap'n Web WebSocket API, the same transport the browser uses.
+// Drives Workshop through the same bounded HTTP connection and callbacks as the browser.
 
 import { createHash } from "node:crypto";
-import { RpcStub, RpcTarget, newWebSocketRpcSession } from "capnweb";
+import { RpcStub, RpcTarget, connectWorkshop } from "../../workshop-frontend/src/rpcTransport";
 import type {
   AiChatSubscriber, AuthenticatedApi, ConnectedAccountsFilter, ConnectedAccountsSubscriber,
   ObserverAccountChoice, ObserverBindingNeed, ObserverConfigCallback, Overseer, PublicApi,
@@ -48,9 +48,12 @@ export function nextUsernames(...prefixes: string[]): string[] {
 
 /** Open an RPC session against the Workshop's /api endpoint. */
 export function connect(baseUrl: URL): RpcStub<PublicApi> {
-  const wsUrl = new URL("/api", baseUrl);
-  wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-  return newWebSocketRpcSession<PublicApi>(wsUrl.toString());
+  return connectWorkshop(new URL('/api', baseUrl).href, (input, init) => {
+    const headers = new Headers(init?.headers);
+    // Node does not supply a browser's Origin automatically. Exercise the real origin check.
+    headers.set('Origin', baseUrl.origin);
+    return fetch(input, { ...init, headers });
+  });
 }
 
 /**

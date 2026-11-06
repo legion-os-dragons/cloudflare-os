@@ -1,9 +1,10 @@
 import { createMcpHandler } from "./incoming-mcp/transport.js";
 import { NativeMcpTools } from "./incoming-mcp/native-tools.js";
 import { AuthenticationError } from "./incoming-mcp/runtime.js";
-import { RpcStub, RpcTarget, RpcSession, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
+import { RpcStub, RpcTarget, RpcSession, newHttpBatchRpcResponse } from "capnweb";
 import { DurableObject } from 'cloudflare:workers';
 import { HttpRpcTransport } from './rpc-transport';
+import { WORKSHOP_RPC_MAX_MESSAGE_BYTES, WORKSHOP_RPC_MAX_HTTP_BYTES } from '@gadgets/workshop-shared/api';
 import { validateRpc } from "capnweb-validate";
 import type { GadgetAccessConfiguration } from "@gadgets/workshop-shared/api";
 import type { JWTPayload } from "jose";
@@ -874,7 +875,9 @@ export class WorkshopConnection extends DurableObject<Env> {
     if (this.transport) throw new Error('Workshop connection already exists.');
     this.identity = this.caller(payload);
     const transport = this.transport = new HttpRpcTransport();
-    new RpcSession(transport, new PublicApiImpl(this.ctx, this.env, reason => transport.abort(reason), payload));
+    new RpcSession(transport, new PublicApiImpl(this.ctx, this.env, reason => transport.abort(reason), payload), {
+      limits: { maxMessageSize: WORKSHOP_RPC_MAX_MESSAGE_BYTES },
+    });
     this.touch();
   }
 
@@ -899,13 +902,15 @@ export class WorkshopConnection extends DurableObject<Env> {
 
   /** Release all capabilities associated with this browser connection. */
   close(payload?: JWTPayload): void {
+    // Cleanup after eviction/reset is idempotent; there are no capabilities left to release.
+    if (!this.transport) return;
     this.authorized(payload).abort(new Error('Workshop connection closed.'));
     clearTimeout(this.idleTimer);
   }
 }
 
-async function readRpcInput(req: Request): Promise<Record<string, unknown>> {
-  if (!req.body) return {};
+async function readRpcText(req: Request): Promise<string> {
+  if (!req.body) return '';
   const reader = req.body.getReader();
   const decoder = new TextDecoder();
   let size = 0, text = '';
@@ -914,12 +919,16 @@ async function readRpcInput(req: Request): Promise<Record<string, unknown>> {
       const chunk = await reader.read();
       if (chunk.done) break;
       size += chunk.value.byteLength;
-      if (size > 32 * 1024 * 1024) throw new Error('Workshop message is too large.');
+      if (size > WORKSHOP_RPC_MAX_HTTP_BYTES) throw new RangeError('Workshop message is too large.');
       text += decoder.decode(chunk.value, { stream: true });
     }
     text += decoder.decode();
-  } finally { await reader.cancel(); reader.releaseLock(); }
-  const value: unknown = JSON.parse(text);
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  return text;
+}
+
+async function readRpcInput(req: Request): Promise<Record<string, unknown>> {
+  const value: unknown = JSON.parse(await readRpcText(req) || '{}');
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Workshop message.');
   return value as Record<string, unknown>;
 }
@@ -1040,13 +1049,9 @@ export default {
         }
       }
 
-      // HACK: Implement `abortSession` callback by closing the websocket.
-      // TODO: When ctx.abort() becomes non-experimental, consider using that instead.
-      let abortController = new AbortController();
+      // One-shot and external MCP requests report session failures through their own RPC result.
       let abortSession = (reason: Error) => {
-        // Closing the socket fails no invocation, so nothing else logs this.
         logger.warn("aborting api session", { event: "session.abort", error: reason });
-        abortController.abort(reason);
       };
 
       if (url.pathname === "/api/mcp") {
@@ -1060,69 +1065,27 @@ export default {
           } catch { throw new AuthenticationError(); }
         }})(req);
       }
-      return await newWorkersRpcResponse(req,
+      // One-shot clients keep the native Cap'n Web batch API. Browser capabilities and callbacks
+      // use WorkshopConnection above; a Worker-owned WebSocket would retain one invocation budget.
+      if (req.method !== 'POST') {
+        return new Response('Reload Workshop to reconnect using the current transport.', {
+          status: 405, headers: { Allow: 'POST' },
+        });
+      }
+      let body: string;
+      try { body = await readRpcText(req); }
+      catch (error) {
+        if (error instanceof RangeError) return new Response(error.message, { status: 413 });
+        throw error;
+      }
+      const boundedRequest = new Request(req.url, { method: 'POST', headers: req.headers, body });
+      const response = await newHttpBatchRpcResponse(boundedRequest,
           new PublicApiImpl(ctx, env, abortSession, accessPayload),
-          { abortSignal: abortController.signal });
+          { limits: { maxMessageSize: WORKSHOP_RPC_MAX_MESSAGE_BYTES } });
+      response.headers.set('Access-Control-Allow-Origin', env.CF_ACCESS_AUD ? url.origin : '*');
+      return response;
     }
 
     return new Response("Not Found", {status: 404});
   }
 } satisfies ExportedHandler<Env>;
-
-// Extend Cap'n Web's RpcSessionOptions with an AbortSignal.
-//
-// TODO: Consider adding this feature to Cap'n Web. However, we might not actually need it for
-//   long: ctx.abort() will soon be available non-experimentally, in which case we can just use
-//   that instead.
-type ExtendedRpcSessionOptions = RpcSessionOptions & {
-  // Abort WebSocket sessions when this AbortSignal is aborted. (No effect on HTTP batch sessions.)
-  abortSignal: AbortSignal;
-};
-
-// Clone of newWorkersRpcResponse() from Cap'n Web, except the `options` has been extended with
-// `abortSignal`.
-async function newWorkersRpcResponse(
-    request: Request, localMain: any, options?: ExtendedRpcSessionOptions) {
-  if (request.method === "POST") {
-    let response = await newHttpBatchRpcResponse(request, localMain, options);
-    // Since we're exposing the same API over WebSocket, too, and WebSocket always allows
-    // cross-origin requests, the API necessarily must be safe for cross-origin use (e.g. because
-    // it uses in-band authorization, as recommended in the readme). So, we might as well allow
-    // batch requests to be made cross-origin as well.
-    response.headers.set("Access-Control-Allow-Origin", "*");
-    return response;
-  } else if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-    return newWorkersWebSocketRpcResponse(request, localMain, options);
-  } else {
-    return new Response("This endpoint only accepts POST or WebSocket requests.", { status: 400 });
-  }
-}
-
-function newWorkersWebSocketRpcResponse(
-    request: Request, localMain?: any, options?: ExtendedRpcSessionOptions): Response {
-  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-    return new Response("This endpoint only accepts WebSocket requests.", { status: 400 });
-  }
-
-  let pair = new WebSocketPair();
-  let server = pair[0];
-  server.accept()
-  let stub = newWebSocketRpcSession(server, localMain, options);
-
-  // -- ADDED FOR GADGETS --
-  if (options?.abortSignal) {
-    if (options.abortSignal.aborted) {
-      stub[Symbol.dispose]();
-    } else {
-      options.abortSignal.addEventListener("abort", () => {
-        stub[Symbol.dispose]();
-      });
-    }
-  }
-  // -- END ADDED FOR GADGETS --
-
-  return new Response(null, {
-    status: 101,
-    webSocket: pair[1],
-  });
-}
